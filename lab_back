@@ -1,0 +1,2499 @@
+--
+-- PostgreSQL database dump
+--
+
+\restrict kLXheb6Ac5pb9Ozp0mpU08aE6WzXJiYv33fx0FpK1m7Ms0vb5uQEku8THo1xqJn
+
+-- Dumped from database version 16.15 (Debian 16.15-1.pgdg13+2)
+-- Dumped by pg_dump version 18.2
+
+-- Started on 2026-10-19 23:52:29
+
+SET statement_timeout = 0;
+SET lock_timeout = 0;
+SET idle_in_transaction_session_timeout = 0;
+SET transaction_timeout = 0;
+SET client_encoding = 'UTF8';
+SET standard_conforming_strings = on;
+SELECT pg_catalog.set_config('search_path', '', false);
+SET check_function_bodies = false;
+SET xmloption = content;
+SET client_min_messages = warning;
+SET row_security = off;
+
+--
+-- TOC entry 3 (class 3079 OID 16426)
+-- Name: citext; Type: EXTENSION; Schema: -; Owner: -
+--
+
+CREATE EXTENSION IF NOT EXISTS citext WITH SCHEMA public;
+
+
+--
+-- TOC entry 3988 (class 0 OID 0)
+-- Dependencies: 3
+-- Name: EXTENSION citext; Type: COMMENT; Schema: -; Owner: 
+--
+
+COMMENT ON EXTENSION citext IS 'data type for case-insensitive character strings';
+
+
+--
+-- TOC entry 2 (class 3079 OID 16389)
+-- Name: pgcrypto; Type: EXTENSION; Schema: -; Owner: -
+--
+
+CREATE EXTENSION IF NOT EXISTS pgcrypto WITH SCHEMA public;
+
+
+--
+-- TOC entry 3989 (class 0 OID 0)
+-- Dependencies: 2
+-- Name: EXTENSION pgcrypto; Type: COMMENT; Schema: -; Owner: 
+--
+
+COMMENT ON EXTENSION pgcrypto IS 'cryptographic functions';
+
+
+--
+-- TOC entry 334 (class 1255 OID 17077)
+-- Name: fn_calculate_level(bigint); Type: FUNCTION; Schema: public; Owner: lab1
+--
+
+CREATE FUNCTION public.fn_calculate_level(p_total_xp bigint) RETURNS smallint
+    LANGUAGE sql STABLE PARALLEL SAFE
+    AS $$
+    SELECT COALESCE(
+        (
+            SELECT level
+            FROM public.levels
+            WHERE xp_required <= COALESCE(p_total_xp, 0)
+            ORDER BY level DESC
+            LIMIT 1
+        ),
+        1
+    )::SMALLINT;
+$$;
+
+
+ALTER FUNCTION public.fn_calculate_level(p_total_xp bigint) OWNER TO lab1;
+
+--
+-- TOC entry 270 (class 1255 OID 17076)
+-- Name: fn_combo_multiplier(integer); Type: FUNCTION; Schema: public; Owner: lab1
+--
+
+CREATE FUNCTION public.fn_combo_multiplier(p_combo integer) RETURNS numeric
+    LANGUAGE sql IMMUTABLE PARALLEL SAFE
+    AS $$
+    SELECT CASE
+        WHEN COALESCE(p_combo, 0) >= 50 THEN 5.0
+        WHEN COALESCE(p_combo, 0) >= 25 THEN 3.0
+        WHEN COALESCE(p_combo, 0) >= 10 THEN 2.0
+        ELSE 1.0
+    END::NUMERIC;
+$$;
+
+
+ALTER FUNCTION public.fn_combo_multiplier(p_combo integer) OWNER TO lab1;
+
+--
+-- TOC entry 278 (class 1255 OID 17079)
+-- Name: fn_leaderboard(text, text, integer); Type: FUNCTION; Schema: public; Owner: lab1
+--
+
+CREATE FUNCTION public.fn_leaderboard(p_metric text DEFAULT 'xp'::text, p_period text DEFAULT 'all'::text, p_limit integer DEFAULT 100) RETURNS TABLE(user_id uuid, display_name text, value numeric, rank bigint)
+    LANGUAGE plpgsql STABLE
+    AS $$
+DECLARE
+    v_start TIMESTAMPTZ;
+BEGIN
+    p_metric := lower(p_metric);
+    p_period := lower(p_period);
+
+    IF p_metric NOT IN ('wpm', 'cpm', 'accuracy', 'xp') THEN
+        RAISE EXCEPTION 'Unsupported metric: %', p_metric;
+    END IF;
+
+    IF p_period NOT IN ('day', 'week', 'month', 'all') THEN
+        RAISE EXCEPTION 'Unsupported period: %', p_period;
+    END IF;
+
+    IF p_limit IS NULL OR p_limit < 1 THEN
+        p_limit := 100;
+    END IF;
+
+    IF p_limit > 500 THEN
+        p_limit := 500;
+    END IF;
+
+    IF p_period = 'day' THEN
+        v_start := date_trunc('day', now());
+    ELSIF p_period = 'week' THEN
+        v_start := date_trunc('week', now());
+    ELSIF p_period = 'month' THEN
+        v_start := date_trunc('month', now());
+    ELSE
+        v_start := NULL;
+    END IF;
+
+    RETURN QUERY
+    WITH base AS (
+        SELECT
+            s.user_id,
+            COALESCE(u.display_name, split_part(u.email::text, '@', 1)) AS display_name,
+            s.wpm,
+            s.cpm,
+            s.accuracy,
+            s.xp_earned
+        FROM public.sessions s
+        JOIN public.users u ON u.id = s.user_id
+        WHERE s.status = 'completed'
+          AND s.user_id IS NOT NULL
+          AND (v_start IS NULL OR s.ended_at >= v_start)
+    ),
+    agg AS (
+        SELECT
+            user_id,
+            display_name,
+            CASE p_metric
+                WHEN 'xp' THEN SUM(xp_earned)::NUMERIC
+                WHEN 'wpm' THEN MAX(wpm)::NUMERIC
+                WHEN 'cpm' THEN MAX(cpm)::NUMERIC
+                WHEN 'accuracy' THEN MAX(accuracy)::NUMERIC
+            END AS value
+        FROM base
+        GROUP BY user_id, display_name
+    )
+    SELECT
+        agg.user_id,
+        agg.display_name,
+        agg.value,
+        RANK() OVER (ORDER BY agg.value DESC) AS rank
+    FROM agg
+    ORDER BY 4, 3 DESC
+    LIMIT p_limit;
+END;
+$$;
+
+
+ALTER FUNCTION public.fn_leaderboard(p_metric text, p_period text, p_limit integer) OWNER TO lab1;
+
+--
+-- TOC entry 271 (class 1255 OID 17078)
+-- Name: fn_session_accuracy(integer, integer); Type: FUNCTION; Schema: public; Owner: lab1
+--
+
+CREATE FUNCTION public.fn_session_accuracy(p_correct integer, p_incorrect integer) RETURNS numeric
+    LANGUAGE sql IMMUTABLE PARALLEL SAFE
+    AS $$
+    SELECT CASE
+        WHEN COALESCE(p_correct, 0) + COALESCE(p_incorrect, 0) = 0 THEN 0.00
+        ELSE ROUND(100.0 * p_correct / (p_correct + p_incorrect), 2)
+    END::NUMERIC;
+$$;
+
+
+ALTER FUNCTION public.fn_session_accuracy(p_correct integer, p_incorrect integer) OWNER TO lab1;
+
+--
+-- TOC entry 304 (class 1255 OID 17089)
+-- Name: fn_user_after_insert(); Type: FUNCTION; Schema: public; Owner: lab1
+--
+
+CREATE FUNCTION public.fn_user_after_insert() RETURNS trigger
+    LANGUAGE plpgsql SECURITY DEFINER
+    SET search_path TO 'public'
+    AS $$
+BEGIN
+    INSERT INTO public.user_settings (user_id)
+    VALUES (NEW.id)
+    ON CONFLICT (user_id) DO NOTHING;
+
+    INSERT INTO public.user_progress (user_id, level, total_xp)
+    VALUES (NEW.id, public.fn_calculate_level(0), 0)
+    ON CONFLICT (user_id) DO NOTHING;
+
+    RETURN NEW;
+END;
+$$;
+
+
+ALTER FUNCTION public.fn_user_after_insert() OWNER TO lab1;
+
+--
+-- TOC entry 286 (class 1255 OID 17091)
+-- Name: fn_user_progress_before_update(); Type: FUNCTION; Schema: public; Owner: lab1
+--
+
+CREATE FUNCTION public.fn_user_progress_before_update() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+BEGIN
+    NEW.level = public.fn_calculate_level(NEW.total_xp);
+    NEW.updated_at = now();
+    RETURN NEW;
+END;
+$$;
+
+
+ALTER FUNCTION public.fn_user_progress_before_update() OWNER TO lab1;
+
+--
+-- TOC entry 340 (class 1255 OID 16531)
+-- Name: set_updated_at(); Type: FUNCTION; Schema: public; Owner: lab1
+--
+
+CREATE FUNCTION public.set_updated_at() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+BEGIN
+    NEW.updated_at = now();
+    RETURN NEW;
+END;
+$$;
+
+
+ALTER FUNCTION public.set_updated_at() OWNER TO lab1;
+
+SET default_tablespace = '';
+
+SET default_table_access_method = heap;
+
+--
+-- TOC entry 242 (class 1259 OID 16943)
+-- Name: achievements; Type: TABLE; Schema: public; Owner: lab1
+--
+
+CREATE TABLE public.achievements (
+    code text NOT NULL,
+    title text NOT NULL,
+    description text NOT NULL,
+    category text NOT NULL,
+    condition_type text NOT NULL,
+    condition_value jsonb NOT NULL,
+    xp_reward bigint DEFAULT 0 NOT NULL,
+    score_reward bigint DEFAULT 0 NOT NULL,
+    badge_icon text,
+    badge_color text,
+    is_hidden boolean DEFAULT false NOT NULL,
+    unlock_level smallint,
+    metadata jsonb DEFAULT '{}'::jsonb NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT achievements_category_check CHECK ((category = ANY (ARRAY['speed'::text, 'accuracy'::text, 'combo'::text, 'volume'::text, 'mode'::text, 'social'::text, 'special'::text]))),
+    CONSTRAINT achievements_condition_type_check CHECK ((condition_type = ANY (ARRAY['metric_threshold'::text, 'session_condition'::text, 'count_condition'::text, 'multi_mode_condition'::text, 'streak_condition'::text, 'level_condition'::text]))),
+    CONSTRAINT achievements_score_reward_check CHECK ((score_reward >= 0)),
+    CONSTRAINT achievements_xp_reward_check CHECK ((xp_reward >= 0))
+);
+
+
+ALTER TABLE public.achievements OWNER TO lab1;
+
+--
+-- TOC entry 244 (class 1259 OID 16990)
+-- Name: bonus_definitions; Type: TABLE; Schema: public; Owner: lab1
+--
+
+CREATE TABLE public.bonus_definitions (
+    code text NOT NULL,
+    name text NOT NULL,
+    description text NOT NULL,
+    effect_type text NOT NULL,
+    effect_value jsonb NOT NULL,
+    duration_seconds integer DEFAULT 0 NOT NULL,
+    trigger_chance numeric(5,4) DEFAULT 0 NOT NULL,
+    cooldown_seconds integer DEFAULT 0 NOT NULL,
+    max_per_session integer DEFAULT 1 NOT NULL,
+    min_level smallint DEFAULT 1 NOT NULL,
+    icon text,
+    color text,
+    is_enabled boolean DEFAULT true NOT NULL,
+    metadata jsonb DEFAULT '{}'::jsonb NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT bonus_definitions_cooldown_seconds_check CHECK ((cooldown_seconds >= 0)),
+    CONSTRAINT bonus_definitions_duration_seconds_check CHECK ((duration_seconds >= 0)),
+    CONSTRAINT bonus_definitions_effect_type_check CHECK ((effect_type = ANY (ARRAY['xp_multiplier'::text, 'score_multiplier'::text, 'cpm_multiplier'::text, 'error_shield'::text, 'combo_keep'::text, 'instant_xp'::text, 'instant_score'::text, 'hint_boost'::text]))),
+    CONSTRAINT bonus_definitions_max_per_session_check CHECK ((max_per_session >= 1)),
+    CONSTRAINT bonus_definitions_trigger_chance_check CHECK (((trigger_chance >= (0)::numeric) AND (trigger_chance <= (1)::numeric)))
+);
+
+
+ALTER TABLE public.bonus_definitions OWNER TO lab1;
+
+--
+-- TOC entry 241 (class 1259 OID 16916)
+-- Name: character_stats; Type: TABLE; Schema: public; Owner: lab1
+--
+
+CREATE TABLE public.character_stats (
+    user_id uuid NOT NULL,
+    "char" text NOT NULL,
+    attempts integer DEFAULT 0 NOT NULL,
+    correct integer DEFAULT 0 NOT NULL,
+    incorrect integer DEFAULT 0 NOT NULL,
+    total_time_ms bigint DEFAULT 0 NOT NULL,
+    avg_delay_ms numeric(10,2) DEFAULT 0 NOT NULL,
+    last_seen_at timestamp with time zone,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT character_stats_attempts_check CHECK ((attempts >= 0)),
+    CONSTRAINT character_stats_char_check CHECK (("char" <> ''::text)),
+    CONSTRAINT character_stats_check CHECK ((correct <= attempts)),
+    CONSTRAINT character_stats_check1 CHECK ((incorrect <= attempts)),
+    CONSTRAINT character_stats_correct_check CHECK ((correct >= 0)),
+    CONSTRAINT character_stats_incorrect_check CHECK ((incorrect >= 0)),
+    CONSTRAINT character_stats_total_time_ms_check CHECK ((total_time_ms >= 0))
+);
+
+
+ALTER TABLE public.character_stats OWNER TO lab1;
+
+--
+-- TOC entry 229 (class 1259 OID 16651)
+-- Name: code_snippets; Type: TABLE; Schema: public; Owner: lab1
+--
+
+CREATE TABLE public.code_snippets (
+    id bigint NOT NULL,
+    programming_language text NOT NULL,
+    code text NOT NULL,
+    difficulty smallint DEFAULT 1 NOT NULL,
+    char_count integer GENERATED ALWAYS AS (char_length(code)) STORED,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT code_snippets_difficulty_check CHECK (((difficulty >= 1) AND (difficulty <= 5))),
+    CONSTRAINT code_snippets_programming_language_check CHECK ((programming_language = ANY (ARRAY['python'::text, 'javascript'::text, 'html_css'::text])))
+);
+
+
+ALTER TABLE public.code_snippets OWNER TO lab1;
+
+--
+-- TOC entry 228 (class 1259 OID 16650)
+-- Name: code_snippets_id_seq; Type: SEQUENCE; Schema: public; Owner: lab1
+--
+
+CREATE SEQUENCE public.code_snippets_id_seq
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1;
+
+
+ALTER SEQUENCE public.code_snippets_id_seq OWNER TO lab1;
+
+--
+-- TOC entry 3990 (class 0 OID 0)
+-- Dependencies: 228
+-- Name: code_snippets_id_seq; Type: SEQUENCE OWNED BY; Schema: public; Owner: lab1
+--
+
+ALTER SEQUENCE public.code_snippets_id_seq OWNED BY public.code_snippets.id;
+
+
+--
+-- TOC entry 223 (class 1259 OID 16591)
+-- Name: exercise_modes; Type: TABLE; Schema: public; Owner: lab1
+--
+
+CREATE TABLE public.exercise_modes (
+    code text NOT NULL,
+    name text NOT NULL,
+    description text,
+    min_level smallint DEFAULT 1 NOT NULL,
+    default_language_code text,
+    metadata jsonb DEFAULT '{}'::jsonb NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT exercise_modes_code_check CHECK ((code = ANY (ARRAY['words'::text, 'sentences'::text, 'code'::text, 'symbols'::text]))),
+    CONSTRAINT exercise_modes_min_level_check CHECK ((min_level >= 1))
+);
+
+
+ALTER TABLE public.exercise_modes OWNER TO lab1;
+
+--
+-- TOC entry 222 (class 1259 OID 16568)
+-- Name: key_variants; Type: TABLE; Schema: public; Owner: lab1
+--
+
+CREATE TABLE public.key_variants (
+    layout_id text NOT NULL,
+    key_code text NOT NULL,
+    "char" text NOT NULL,
+    shift boolean DEFAULT false NOT NULL,
+    altgr boolean DEFAULT false NOT NULL,
+    finger smallint NOT NULL,
+    hand character(1) NOT NULL,
+    CONSTRAINT key_variants_char_check CHECK (("char" <> ''::text)),
+    CONSTRAINT key_variants_finger_check CHECK (((finger >= 0) AND (finger <= 9))),
+    CONSTRAINT key_variants_hand_check CHECK ((hand = ANY (ARRAY['L'::bpchar, 'R'::bpchar, 'T'::bpchar])))
+);
+
+
+ALTER TABLE public.key_variants OWNER TO lab1;
+
+--
+-- TOC entry 3991 (class 0 OID 0)
+-- Dependencies: 222
+-- Name: COLUMN key_variants.finger; Type: COMMENT; Schema: public; Owner: lab1
+--
+
+COMMENT ON COLUMN public.key_variants.finger IS '1 LP, 2 LR, 3 LM, 4 LI, 5 RI, 6 RM, 7 RR, 8 RP, 9 thumb, 0 unknown';
+
+
+--
+-- TOC entry 220 (class 1259 OID 16541)
+-- Name: keyboard_layouts; Type: TABLE; Schema: public; Owner: lab1
+--
+
+CREATE TABLE public.keyboard_layouts (
+    id text NOT NULL,
+    code text NOT NULL,
+    name text NOT NULL,
+    language_code text NOT NULL,
+    is_default boolean DEFAULT false NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL
+);
+
+
+ALTER TABLE public.keyboard_layouts OWNER TO lab1;
+
+--
+-- TOC entry 221 (class 1259 OID 16557)
+-- Name: keys; Type: TABLE; Schema: public; Owner: lab1
+--
+
+CREATE TABLE public.keys (
+    key_code text NOT NULL,
+    row_no smallint NOT NULL,
+    col_no numeric NOT NULL,
+    width_units numeric DEFAULT 1 NOT NULL,
+    key_type text DEFAULT 'printable'::text NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT keys_key_type_check CHECK ((key_type = ANY (ARRAY['printable'::text, 'space'::text, 'enter'::text, 'tab'::text, 'modifier'::text, 'backspace'::text])))
+);
+
+
+ALTER TABLE public.keys OWNER TO lab1;
+
+--
+-- TOC entry 219 (class 1259 OID 16532)
+-- Name: languages; Type: TABLE; Schema: public; Owner: lab1
+--
+
+CREATE TABLE public.languages (
+    code text NOT NULL,
+    name text NOT NULL,
+    native_name text NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT languages_code_check CHECK ((code = ANY (ARRAY['ru'::text, 'en'::text])))
+);
+
+
+ALTER TABLE public.languages OWNER TO lab1;
+
+--
+-- TOC entry 236 (class 1259 OID 16771)
+-- Name: levels; Type: TABLE; Schema: public; Owner: lab1
+--
+
+CREATE TABLE public.levels (
+    level smallint NOT NULL,
+    title text NOT NULL,
+    xp_required bigint NOT NULL,
+    unlocks_modes text[] DEFAULT ARRAY[]::text[] NOT NULL,
+    bonus_multiplier numeric(4,2) DEFAULT 1.00 NOT NULL,
+    color text,
+    icon text,
+    description text,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT levels_bonus_multiplier_check CHECK ((bonus_multiplier > (0)::numeric)),
+    CONSTRAINT levels_level_check CHECK ((level >= 1)),
+    CONSTRAINT levels_xp_required_check CHECK ((xp_required >= 0))
+);
+
+
+ALTER TABLE public.levels OWNER TO lab1;
+
+--
+-- TOC entry 233 (class 1259 OID 16707)
+-- Name: oauth_accounts; Type: TABLE; Schema: public; Owner: lab1
+--
+
+CREATE TABLE public.oauth_accounts (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    user_id uuid NOT NULL,
+    provider text NOT NULL,
+    provider_user_id text NOT NULL,
+    access_token text,
+    refresh_token text,
+    expires_at timestamp with time zone,
+    scopes text,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT oauth_accounts_provider_check CHECK ((provider = ANY (ARRAY['google'::text, 'yandex'::text, 'github'::text, 'vk'::text])))
+);
+
+
+ALTER TABLE public.oauth_accounts OWNER TO lab1;
+
+--
+-- TOC entry 234 (class 1259 OID 16725)
+-- Name: refresh_tokens; Type: TABLE; Schema: public; Owner: lab1
+--
+
+CREATE TABLE public.refresh_tokens (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    user_id uuid NOT NULL,
+    token_hash text NOT NULL,
+    expires_at timestamp with time zone NOT NULL,
+    revoked_at timestamp with time zone,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    ip inet,
+    user_agent text
+);
+
+
+ALTER TABLE public.refresh_tokens OWNER TO lab1;
+
+--
+-- TOC entry 227 (class 1259 OID 16631)
+-- Name: sentences; Type: TABLE; Schema: public; Owner: lab1
+--
+
+CREATE TABLE public.sentences (
+    id bigint NOT NULL,
+    language_code text NOT NULL,
+    text text NOT NULL,
+    difficulty smallint DEFAULT 1 NOT NULL,
+    char_count integer GENERATED ALWAYS AS (char_length(text)) STORED,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT sentences_difficulty_check CHECK (((difficulty >= 1) AND (difficulty <= 5)))
+);
+
+
+ALTER TABLE public.sentences OWNER TO lab1;
+
+--
+-- TOC entry 226 (class 1259 OID 16630)
+-- Name: sentences_id_seq; Type: SEQUENCE; Schema: public; Owner: lab1
+--
+
+CREATE SEQUENCE public.sentences_id_seq
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1;
+
+
+ALTER SEQUENCE public.sentences_id_seq OWNER TO lab1;
+
+--
+-- TOC entry 3992 (class 0 OID 0)
+-- Dependencies: 226
+-- Name: sentences_id_seq; Type: SEQUENCE OWNED BY; Schema: public; Owner: lab1
+--
+
+ALTER SEQUENCE public.sentences_id_seq OWNED BY public.sentences.id;
+
+
+--
+-- TOC entry 247 (class 1259 OID 17045)
+-- Name: session_bonus_activations; Type: TABLE; Schema: public; Owner: lab1
+--
+
+CREATE TABLE public.session_bonus_activations (
+    id bigint NOT NULL,
+    session_id uuid NOT NULL,
+    bonus_code text NOT NULL,
+    activated_at timestamp with time zone DEFAULT now() NOT NULL,
+    duration_seconds integer DEFAULT 0 NOT NULL,
+    effect jsonb NOT NULL,
+    source text DEFAULT 'random'::text NOT NULL,
+    metadata jsonb DEFAULT '{}'::jsonb NOT NULL,
+    CONSTRAINT session_bonus_activations_source_check CHECK ((source = ANY (ARRAY['random'::text, 'achievement'::text, 'manual'::text, 'admin'::text, 'level_up'::text])))
+);
+
+
+ALTER TABLE public.session_bonus_activations OWNER TO lab1;
+
+--
+-- TOC entry 246 (class 1259 OID 17044)
+-- Name: session_bonus_activations_id_seq; Type: SEQUENCE; Schema: public; Owner: lab1
+--
+
+CREATE SEQUENCE public.session_bonus_activations_id_seq
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1;
+
+
+ALTER SEQUENCE public.session_bonus_activations_id_seq OWNER TO lab1;
+
+--
+-- TOC entry 3993 (class 0 OID 0)
+-- Dependencies: 246
+-- Name: session_bonus_activations_id_seq; Type: SEQUENCE OWNED BY; Schema: public; Owner: lab1
+--
+
+ALTER SEQUENCE public.session_bonus_activations_id_seq OWNED BY public.session_bonus_activations.id;
+
+
+--
+-- TOC entry 240 (class 1259 OID 16888)
+-- Name: session_events; Type: TABLE; Schema: public; Owner: lab1
+--
+
+CREATE TABLE public.session_events (
+    id bigint NOT NULL,
+    session_id uuid NOT NULL,
+    seq integer NOT NULL,
+    occurred_at timestamp with time zone DEFAULT now() NOT NULL,
+    event_type text NOT NULL,
+    key_code text,
+    expected_char text,
+    actual_char text,
+    is_correct boolean,
+    combo_before integer,
+    combo_after integer,
+    score_delta integer DEFAULT 0 NOT NULL,
+    xp_delta integer DEFAULT 0 NOT NULL,
+    metadata jsonb DEFAULT '{}'::jsonb NOT NULL,
+    CONSTRAINT session_events_event_type_check CHECK ((event_type = ANY (ARRAY['keypress'::text, 'error'::text, 'combo'::text, 'bonus'::text, 'achievement'::text, 'word_complete'::text, 'line_complete'::text, 'session_start'::text, 'session_end'::text, 'pause'::text, 'resume'::text]))),
+    CONSTRAINT session_events_seq_check CHECK ((seq >= 0))
+);
+
+
+ALTER TABLE public.session_events OWNER TO lab1;
+
+--
+-- TOC entry 239 (class 1259 OID 16887)
+-- Name: session_events_id_seq; Type: SEQUENCE; Schema: public; Owner: lab1
+--
+
+CREATE SEQUENCE public.session_events_id_seq
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1;
+
+
+ALTER SEQUENCE public.session_events_id_seq OWNER TO lab1;
+
+--
+-- TOC entry 3994 (class 0 OID 0)
+-- Dependencies: 239
+-- Name: session_events_id_seq; Type: SEQUENCE OWNED BY; Schema: public; Owner: lab1
+--
+
+ALTER SEQUENCE public.session_events_id_seq OWNED BY public.session_events.id;
+
+
+--
+-- TOC entry 238 (class 1259 OID 16824)
+-- Name: sessions; Type: TABLE; Schema: public; Owner: lab1
+--
+
+CREATE TABLE public.sessions (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    user_id uuid,
+    anonymous_id text,
+    mode_code text NOT NULL,
+    language_code text NOT NULL,
+    keyboard_layout_id text,
+    started_at timestamp with time zone DEFAULT now() NOT NULL,
+    ended_at timestamp with time zone,
+    duration_seconds integer DEFAULT 0 NOT NULL,
+    status text DEFAULT 'active'::text NOT NULL,
+    total_chars integer DEFAULT 0 NOT NULL,
+    correct_chars integer DEFAULT 0 NOT NULL,
+    incorrect_chars integer DEFAULT 0 NOT NULL,
+    missed_chars integer DEFAULT 0 NOT NULL,
+    accuracy numeric(5,2) DEFAULT 0 NOT NULL,
+    wpm numeric(7,2) DEFAULT 0 NOT NULL,
+    cpm numeric(7,2) DEFAULT 0 NOT NULL,
+    max_combo integer DEFAULT 0 NOT NULL,
+    score bigint DEFAULT 0 NOT NULL,
+    xp_earned bigint DEFAULT 0 NOT NULL,
+    level_before smallint,
+    level_after smallint,
+    anti_cheat jsonb DEFAULT '{}'::jsonb NOT NULL,
+    metadata jsonb DEFAULT '{}'::jsonb NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT sessions_accuracy_check CHECK (((accuracy >= (0)::numeric) AND (accuracy <= (100)::numeric))),
+    CONSTRAINT sessions_check CHECK (((user_id IS NOT NULL) OR (anonymous_id IS NOT NULL))),
+    CONSTRAINT sessions_check1 CHECK ((total_chars >= (correct_chars + incorrect_chars))),
+    CONSTRAINT sessions_correct_chars_check CHECK ((correct_chars >= 0)),
+    CONSTRAINT sessions_cpm_check CHECK ((cpm >= (0)::numeric)),
+    CONSTRAINT sessions_duration_seconds_check CHECK ((duration_seconds >= 0)),
+    CONSTRAINT sessions_incorrect_chars_check CHECK ((incorrect_chars >= 0)),
+    CONSTRAINT sessions_max_combo_check CHECK ((max_combo >= 0)),
+    CONSTRAINT sessions_missed_chars_check CHECK ((missed_chars >= 0)),
+    CONSTRAINT sessions_score_check CHECK ((score >= 0)),
+    CONSTRAINT sessions_status_check CHECK ((status = ANY (ARRAY['active'::text, 'completed'::text, 'abandoned'::text]))),
+    CONSTRAINT sessions_total_chars_check CHECK ((total_chars >= 0)),
+    CONSTRAINT sessions_wpm_check CHECK ((wpm >= (0)::numeric)),
+    CONSTRAINT sessions_xp_earned_check CHECK ((xp_earned >= 0))
+);
+
+
+ALTER TABLE public.sessions OWNER TO lab1;
+
+--
+-- TOC entry 231 (class 1259 OID 16667)
+-- Name: symbol_sets; Type: TABLE; Schema: public; Owner: lab1
+--
+
+CREATE TABLE public.symbol_sets (
+    id bigint NOT NULL,
+    name text NOT NULL,
+    chars text NOT NULL,
+    difficulty smallint DEFAULT 1 NOT NULL,
+    language_code text,
+    char_count integer GENERATED ALWAYS AS (char_length(chars)) STORED,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT symbol_sets_difficulty_check CHECK (((difficulty >= 1) AND (difficulty <= 5)))
+);
+
+
+ALTER TABLE public.symbol_sets OWNER TO lab1;
+
+--
+-- TOC entry 230 (class 1259 OID 16666)
+-- Name: symbol_sets_id_seq; Type: SEQUENCE; Schema: public; Owner: lab1
+--
+
+CREATE SEQUENCE public.symbol_sets_id_seq
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1;
+
+
+ALTER SEQUENCE public.symbol_sets_id_seq OWNER TO lab1;
+
+--
+-- TOC entry 3995 (class 0 OID 0)
+-- Dependencies: 230
+-- Name: symbol_sets_id_seq; Type: SEQUENCE OWNED BY; Schema: public; Owner: lab1
+--
+
+ALTER SEQUENCE public.symbol_sets_id_seq OWNED BY public.symbol_sets.id;
+
+
+--
+-- TOC entry 243 (class 1259 OID 16964)
+-- Name: user_achievements; Type: TABLE; Schema: public; Owner: lab1
+--
+
+CREATE TABLE public.user_achievements (
+    user_id uuid NOT NULL,
+    achievement_code text NOT NULL,
+    progress_value numeric DEFAULT 0 NOT NULL,
+    target_value numeric DEFAULT 1 NOT NULL,
+    completed boolean DEFAULT false NOT NULL,
+    unlocked_at timestamp with time zone,
+    metadata jsonb DEFAULT '{}'::jsonb NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT user_achievements_progress_value_check CHECK ((progress_value >= (0)::numeric)),
+    CONSTRAINT user_achievements_target_value_check CHECK ((target_value > (0)::numeric))
+);
+
+
+ALTER TABLE public.user_achievements OWNER TO lab1;
+
+--
+-- TOC entry 245 (class 1259 OID 17015)
+-- Name: user_active_bonuses; Type: TABLE; Schema: public; Owner: lab1
+--
+
+CREATE TABLE public.user_active_bonuses (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    user_id uuid NOT NULL,
+    bonus_code text NOT NULL,
+    session_id uuid,
+    started_at timestamp with time zone DEFAULT now() NOT NULL,
+    expires_at timestamp with time zone,
+    effect_snapshot jsonb NOT NULL,
+    status text DEFAULT 'active'::text NOT NULL,
+    metadata jsonb DEFAULT '{}'::jsonb NOT NULL,
+    CONSTRAINT user_active_bonuses_check CHECK (((expires_at IS NULL) OR (expires_at > started_at))),
+    CONSTRAINT user_active_bonuses_status_check CHECK ((status = ANY (ARRAY['active'::text, 'expired'::text, 'consumed'::text, 'cancelled'::text])))
+);
+
+
+ALTER TABLE public.user_active_bonuses OWNER TO lab1;
+
+--
+-- TOC entry 237 (class 1259 OID 16786)
+-- Name: user_progress; Type: TABLE; Schema: public; Owner: lab1
+--
+
+CREATE TABLE public.user_progress (
+    user_id uuid NOT NULL,
+    total_xp bigint DEFAULT 0 NOT NULL,
+    level smallint DEFAULT 1 NOT NULL,
+    total_sessions integer DEFAULT 0 NOT NULL,
+    total_time_seconds bigint DEFAULT 0 NOT NULL,
+    total_chars integer DEFAULT 0 NOT NULL,
+    correct_chars integer DEFAULT 0 NOT NULL,
+    incorrect_chars integer DEFAULT 0 NOT NULL,
+    best_wpm numeric(7,2) DEFAULT 0 NOT NULL,
+    best_cpm numeric(7,2) DEFAULT 0 NOT NULL,
+    best_accuracy numeric(5,2) DEFAULT 0 NOT NULL,
+    longest_combo integer DEFAULT 0 NOT NULL,
+    streak_days integer DEFAULT 0 NOT NULL,
+    last_session_date date,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT user_progress_best_accuracy_check CHECK (((best_accuracy >= (0)::numeric) AND (best_accuracy <= (100)::numeric))),
+    CONSTRAINT user_progress_best_cpm_check CHECK ((best_cpm >= (0)::numeric)),
+    CONSTRAINT user_progress_best_wpm_check CHECK ((best_wpm >= (0)::numeric)),
+    CONSTRAINT user_progress_longest_combo_check CHECK ((longest_combo >= 0)),
+    CONSTRAINT user_progress_streak_days_check CHECK ((streak_days >= 0)),
+    CONSTRAINT user_progress_total_xp_check CHECK ((total_xp >= 0))
+);
+
+
+ALTER TABLE public.user_progress OWNER TO lab1;
+
+--
+-- TOC entry 235 (class 1259 OID 16742)
+-- Name: user_settings; Type: TABLE; Schema: public; Owner: lab1
+--
+
+CREATE TABLE public.user_settings (
+    user_id uuid NOT NULL,
+    keyboard_layout_id text,
+    sound_enabled boolean DEFAULT true NOT NULL,
+    visual_effects boolean DEFAULT true NOT NULL,
+    reduced_motion boolean DEFAULT false NOT NULL,
+    theme text DEFAULT 'dark'::text NOT NULL,
+    show_keyboard_hint boolean DEFAULT true NOT NULL,
+    highlight_style text DEFAULT 'char'::text NOT NULL,
+    daily_goal_minutes integer DEFAULT 15 NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT user_settings_daily_goal_minutes_check CHECK (((daily_goal_minutes >= 0) AND (daily_goal_minutes <= 480))),
+    CONSTRAINT user_settings_highlight_style_check CHECK ((highlight_style = ANY (ARRAY['char'::text, 'word'::text]))),
+    CONSTRAINT user_settings_theme_check CHECK ((theme = ANY (ARRAY['light'::text, 'dark'::text, 'system'::text])))
+);
+
+
+ALTER TABLE public.user_settings OWNER TO lab1;
+
+--
+-- TOC entry 232 (class 1259 OID 16686)
+-- Name: users; Type: TABLE; Schema: public; Owner: lab1
+--
+
+CREATE TABLE public.users (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    email public.citext NOT NULL,
+    password_hash text,
+    display_name text DEFAULT 'Printer'::text NOT NULL,
+    avatar_url text,
+    timezone text DEFAULT 'UTC'::text NOT NULL,
+    locale text DEFAULT 'en'::text NOT NULL,
+    is_active boolean DEFAULT true NOT NULL,
+    is_email_verified boolean DEFAULT false NOT NULL,
+    role text DEFAULT 'user'::text NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    last_login_at timestamp with time zone,
+    CONSTRAINT users_role_check CHECK ((role = ANY (ARRAY['user'::text, 'admin'::text])))
+);
+
+
+ALTER TABLE public.users OWNER TO lab1;
+
+--
+-- TOC entry 249 (class 1259 OID 17085)
+-- Name: v_character_difficulty; Type: VIEW; Schema: public; Owner: lab1
+--
+
+CREATE VIEW public.v_character_difficulty AS
+ SELECT user_id,
+    "char",
+    attempts,
+    correct,
+    incorrect,
+        CASE
+            WHEN (attempts > 0) THEN round(((100.0 * (incorrect)::numeric) / (attempts)::numeric), 2)
+            ELSE (0)::numeric
+        END AS error_rate,
+    avg_delay_ms,
+    last_seen_at
+   FROM public.character_stats cs
+  WHERE (attempts >= 5);
+
+
+ALTER VIEW public.v_character_difficulty OWNER TO lab1;
+
+--
+-- TOC entry 248 (class 1259 OID 17080)
+-- Name: v_daily_user_stats; Type: VIEW; Schema: public; Owner: lab1
+--
+
+CREATE VIEW public.v_daily_user_stats AS
+ SELECT user_id,
+    ((ended_at AT TIME ZONE 'UTC'::text))::date AS stat_date,
+    count(*) AS sessions,
+    COALESCE(sum(correct_chars), (0)::bigint) AS correct_chars,
+    COALESCE(sum(incorrect_chars), (0)::bigint) AS incorrect_chars,
+    round(avg(wpm), 2) AS avg_wpm,
+    round(avg(cpm), 2) AS avg_cpm,
+    round(avg(accuracy), 2) AS avg_accuracy,
+    COALESCE(sum(xp_earned), (0)::numeric) AS xp_earned
+   FROM public.sessions s
+  WHERE ((status = 'completed'::text) AND (user_id IS NOT NULL) AND (ended_at IS NOT NULL))
+  GROUP BY user_id, (((ended_at AT TIME ZONE 'UTC'::text))::date);
+
+
+ALTER VIEW public.v_daily_user_stats OWNER TO lab1;
+
+--
+-- TOC entry 225 (class 1259 OID 16609)
+-- Name: words; Type: TABLE; Schema: public; Owner: lab1
+--
+
+CREATE TABLE public.words (
+    id bigint NOT NULL,
+    language_code text NOT NULL,
+    word text NOT NULL,
+    length integer GENERATED ALWAYS AS (char_length(word)) STORED,
+    frequency integer DEFAULT 0 NOT NULL,
+    difficulty smallint DEFAULT 1 NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT words_difficulty_check CHECK (((difficulty >= 1) AND (difficulty <= 5)))
+);
+
+
+ALTER TABLE public.words OWNER TO lab1;
+
+--
+-- TOC entry 224 (class 1259 OID 16608)
+-- Name: words_id_seq; Type: SEQUENCE; Schema: public; Owner: lab1
+--
+
+CREATE SEQUENCE public.words_id_seq
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1;
+
+
+ALTER SEQUENCE public.words_id_seq OWNER TO lab1;
+
+--
+-- TOC entry 3996 (class 0 OID 0)
+-- Dependencies: 224
+-- Name: words_id_seq; Type: SEQUENCE OWNED BY; Schema: public; Owner: lab1
+--
+
+ALTER SEQUENCE public.words_id_seq OWNED BY public.words.id;
+
+
+--
+-- TOC entry 3525 (class 2604 OID 16654)
+-- Name: code_snippets id; Type: DEFAULT; Schema: public; Owner: lab1
+--
+
+ALTER TABLE ONLY public.code_snippets ALTER COLUMN id SET DEFAULT nextval('public.code_snippets_id_seq'::regclass);
+
+
+--
+-- TOC entry 3521 (class 2604 OID 16634)
+-- Name: sentences id; Type: DEFAULT; Schema: public; Owner: lab1
+--
+
+ALTER TABLE ONLY public.sentences ALTER COLUMN id SET DEFAULT nextval('public.sentences_id_seq'::regclass);
+
+
+--
+-- TOC entry 3621 (class 2604 OID 17048)
+-- Name: session_bonus_activations id; Type: DEFAULT; Schema: public; Owner: lab1
+--
+
+ALTER TABLE ONLY public.session_bonus_activations ALTER COLUMN id SET DEFAULT nextval('public.session_bonus_activations_id_seq'::regclass);
+
+
+--
+-- TOC entry 3588 (class 2604 OID 16891)
+-- Name: session_events id; Type: DEFAULT; Schema: public; Owner: lab1
+--
+
+ALTER TABLE ONLY public.session_events ALTER COLUMN id SET DEFAULT nextval('public.session_events_id_seq'::regclass);
+
+
+--
+-- TOC entry 3529 (class 2604 OID 16670)
+-- Name: symbol_sets id; Type: DEFAULT; Schema: public; Owner: lab1
+--
+
+ALTER TABLE ONLY public.symbol_sets ALTER COLUMN id SET DEFAULT nextval('public.symbol_sets_id_seq'::regclass);
+
+
+--
+-- TOC entry 3516 (class 2604 OID 16612)
+-- Name: words id; Type: DEFAULT; Schema: public; Owner: lab1
+--
+
+ALTER TABLE ONLY public.words ALTER COLUMN id SET DEFAULT nextval('public.words_id_seq'::regclass);
+
+
+--
+-- TOC entry 3977 (class 0 OID 16943)
+-- Dependencies: 242
+-- Data for Name: achievements; Type: TABLE DATA; Schema: public; Owner: lab1
+--
+
+COPY public.achievements (code, title, description, category, condition_type, condition_value, xp_reward, score_reward, badge_icon, badge_color, is_hidden, unlock_level, metadata, created_at) FROM stdin;
+first_steps	Первые шаги	Завершите первую тренировку	volume	metric_threshold	{"value": 1, "metric": "total_sessions", "operator": ">="}	10	100	🎯	#22c55e	f	\N	{}	2026-10-19 20:42:08.745779+00
+hundred_chars	Сто символов	Напечатайте 100 верных символов суммарно	volume	metric_threshold	{"value": 100, "metric": "correct_chars", "operator": ">="}	25	250	📝	#60a5fa	f	\N	{}	2026-10-19 20:42:08.745779+00
+steel_finger	Стальной палец	1000 правильных нажатий подряд без ошибок	combo	metric_threshold	{"value": 1000, "metric": "longest_combo", "operator": ">="}	250	2500	🦾	#a78bfa	f	\N	{}	2026-10-19 20:42:08.745779+00
+printing_genius	Печатный гений	Достичь скорости 300 слов в минуту	speed	metric_threshold	{"value": 300, "metric": "best_wpm", "operator": ">="}	500	5000	🧠	#facc15	f	\N	{}	2026-10-19 20:42:08.745779+00
+speed_demon	Демон скорости	Достичь 200 символов в минуту в сессии от 100 символов	speed	session_condition	{"field": "cpm", "value": 200, "operator": ">=", "min_chars": 100}	150	1500	⚡	#fb923c	f	\N	{}	2026-10-19 20:42:08.745779+00
+laser_focus	Лазерный фокус	Точность 98% и более при 200+ символах	accuracy	session_condition	{"field": "accuracy", "value": 98, "operator": ">=", "min_chars": 200}	150	1500	🎯	#22d3ee	f	\N	{}	2026-10-19 20:42:08.745779+00
+flawless_run	Безупречный пробег	Завершить сессию на 100+ символов без ошибок	accuracy	session_condition	{"field": "incorrect_chars", "value": 0, "operator": "=", "min_chars": 100}	100	1000	💎	#34d399	f	\N	{}	2026-10-19 20:42:08.745779+00
+combo_master	Мастер комбо	Достичь множителя x5: 50 правильных нажатий подряд	combo	metric_threshold	{"value": 50, "metric": "longest_combo", "operator": ">="}	75	750	🔥	#ef4444	f	\N	{}	2026-10-19 20:42:08.745779+00
+code_ninja	Кодовый ниндзя	Завершить 10 тренировок в режиме Код	mode	count_condition	{"value": 10, "operator": ">=", "mode_code": "code"}	200	2000	🥷	#8b5cf6	f	\N	{}	2026-10-19 20:42:08.745779+00
+polyglot	Полиглот	Завершить тренировки на русском и английском языках	mode	multi_mode_condition	{"languages": ["ru", "en"], "min_sessions_each": 1}	100	1000	🌍	#06b6d4	f	\N	{}	2026-10-19 20:42:08.745779+00
+marathoner	Марафонец	Накопить 10 часов общего времени тренировок	volume	metric_threshold	{"value": 36000, "metric": "total_time_seconds", "operator": ">="}	300	3000	🏃	#f59e0b	f	\N	{}	2026-10-19 20:42:08.745779+00
+weekly_streak	Серия недели	Тренироваться 7 дней подряд	special	metric_threshold	{"value": 7, "metric": "streak_days", "operator": ">="}	175	1750	📅	#ec4899	f	\N	{}	2026-10-19 20:42:08.745779+00
+symbol_slayer	Покоритель символов	Сессия в режиме Symbols: 150+ символов и точность 95%+	mode	session_condition	{"field": "accuracy", "value": 95, "operator": ">=", "min_chars": 150, "mode_code": "symbols"}	120	1200	⚔️	#94a3b8	f	\N	{}	2026-10-19 20:42:08.745779+00
+level_10	Десятый уровень	Достичь 10 уровня	special	metric_threshold	{"value": 10, "metric": "level", "operator": ">="}	250	2500	👑	#facc15	f	\N	{}	2026-10-19 20:42:08.745779+00
+\.
+
+
+--
+-- TOC entry 3979 (class 0 OID 16990)
+-- Dependencies: 244
+-- Data for Name: bonus_definitions; Type: TABLE DATA; Schema: public; Owner: lab1
+--
+
+COPY public.bonus_definitions (code, name, description, effect_type, effect_value, duration_seconds, trigger_chance, cooldown_seconds, max_per_session, min_level, icon, color, is_enabled, metadata, created_at) FROM stdin;
+double_xp_10s	Двойной опыт	Удваивает получаемый XP на 10 секунд	xp_multiplier	{"multiplier": 2}	10	0.0800	30	1	1	⚡	#facc15	t	{}	2026-10-19 20:42:08.745779+00
+score_surge_15s	Всплеск очков	Увеличивает очки в 1.5 раза на 15 секунд	score_multiplier	{"multiplier": 1.5}	15	0.0700	45	1	1	🔥	#fb923c	t	{}	2026-10-19 20:42:08.745779+00
+speed_boost_20s	Ускорение	Даёт +50% к бонусной скорости для начисления XP/очков на 20 секунд	cpm_multiplier	{"multiplier": 1.5}	20	0.0500	60	1	3	🚀	#60a5fa	t	{}	2026-10-19 20:42:08.745779+00
+error_shield_10s	Щит ошибок	Ошибки не сбрасывают комбо и могут не учитываться, до 5 ошибок за 10 секунд	error_shield	{"max_errors": 5, "ignore_combo_reset": true, "suppress_error_count": true}	10	0.0600	90	1	2	🛡️	#34d399	t	{}	2026-10-19 20:42:08.745779+00
+combo_keep_15s	Сохранение комбо	Одна ошибка не прерывает серию комбо	combo_keep	{"preserve_one_error": true}	15	0.0400	120	1	5	🧲	#a78bfa	t	{}	2026-10-19 20:42:08.745779+00
+xp_injection	Инъекция опыта	Мгновенно начисляет 100 XP	instant_xp	{"amount": 100}	0	0.0300	180	1	1	💉	#22d3ee	t	{}	2026-10-19 20:42:08.745779+00
+\.
+
+
+--
+-- TOC entry 3976 (class 0 OID 16916)
+-- Dependencies: 241
+-- Data for Name: character_stats; Type: TABLE DATA; Schema: public; Owner: lab1
+--
+
+COPY public.character_stats (user_id, "char", attempts, correct, incorrect, total_time_ms, avg_delay_ms, last_seen_at, updated_at) FROM stdin;
+\.
+
+
+--
+-- TOC entry 3964 (class 0 OID 16651)
+-- Dependencies: 229
+-- Data for Name: code_snippets; Type: TABLE DATA; Schema: public; Owner: lab1
+--
+
+COPY public.code_snippets (id, programming_language, code, difficulty, created_at) FROM stdin;
+1	python	def hello(name):\n    return f"Hello, {name}!"	2	2026-10-19 20:42:08.745779+00
+2	python	items = [x * 2 for x in range(10)]	2	2026-10-19 20:42:08.745779+00
+3	python	if score >= 100:\n    level += 1	1	2026-10-19 20:42:08.745779+00
+4	javascript	const sum = arr.reduce((a, b) => a + b, 0);	3	2026-10-19 20:42:08.745779+00
+5	javascript	document.addEventListener("click", () => {});	2	2026-10-19 20:42:08.745779+00
+6	javascript	async function fetchData(url) {\n  const res = await fetch(url);\n  return res.json();\n}	4	2026-10-19 20:42:08.745779+00
+7	html_css	<div class="card">\n  <h1>Title</h1>\n</div>	2	2026-10-19 20:42:08.745779+00
+8	html_css	.button { color: #fff; background: #000; }	2	2026-10-19 20:42:08.745779+00
+9	html_css	<input type="text" placeholder="Type here" />	1	2026-10-19 20:42:08.745779+00
+\.
+
+
+--
+-- TOC entry 3958 (class 0 OID 16591)
+-- Dependencies: 223
+-- Data for Name: exercise_modes; Type: TABLE DATA; Schema: public; Owner: lab1
+--
+
+COPY public.exercise_modes (code, name, description, min_level, default_language_code, metadata, created_at) FROM stdin;
+words	Слова	Случайные слова из словаря	1	\N	{"max_length": 10, "min_length": 2}	2026-10-19 20:42:08.745779+00
+sentences	Предложения	Связные предложения на русском и английском	3	\N	{}	2026-10-19 20:42:08.745779+00
+code	Код	Фрагменты кода Python, JavaScript, HTML/CSS	5	\N	{}	2026-10-19 20:42:08.745779+00
+symbols	Символы	Случайные буквы, цифры и спецсимволы	1	\N	{}	2026-10-19 20:42:08.745779+00
+\.
+
+
+--
+-- TOC entry 3957 (class 0 OID 16568)
+-- Dependencies: 222
+-- Data for Name: key_variants; Type: TABLE DATA; Schema: public; Owner: lab1
+--
+
+COPY public.key_variants (layout_id, key_code, "char", shift, altgr, finger, hand) FROM stdin;
+en-qwerty	Backquote	`	f	f	1	L
+en-qwerty	Digit1	1	f	f	1	L
+en-qwerty	Digit2	2	f	f	2	L
+en-qwerty	Digit3	3	f	f	3	L
+en-qwerty	Digit4	4	f	f	4	L
+en-qwerty	Digit5	5	f	f	4	L
+en-qwerty	Digit6	6	f	f	5	R
+en-qwerty	Digit7	7	f	f	5	R
+en-qwerty	Digit8	8	f	f	6	R
+en-qwerty	Digit9	9	f	f	7	R
+en-qwerty	Digit0	0	f	f	8	R
+en-qwerty	Minus	-	f	f	8	R
+en-qwerty	Equal	=	f	f	8	R
+en-qwerty	KeyQ	q	f	f	1	L
+en-qwerty	KeyW	w	f	f	2	L
+en-qwerty	KeyE	e	f	f	3	L
+en-qwerty	KeyR	r	f	f	4	L
+en-qwerty	KeyT	t	f	f	4	L
+en-qwerty	KeyY	y	f	f	5	R
+en-qwerty	KeyU	u	f	f	5	R
+en-qwerty	KeyI	i	f	f	6	R
+en-qwerty	KeyO	o	f	f	7	R
+en-qwerty	KeyP	p	f	f	8	R
+en-qwerty	BracketLeft	[	f	f	8	R
+en-qwerty	BracketRight	]	f	f	8	R
+en-qwerty	Backslash	\\	f	f	8	R
+en-qwerty	KeyA	a	f	f	1	L
+en-qwerty	KeyS	s	f	f	2	L
+en-qwerty	KeyD	d	f	f	3	L
+en-qwerty	KeyF	f	f	f	4	L
+en-qwerty	KeyG	g	f	f	4	L
+en-qwerty	KeyH	h	f	f	5	R
+en-qwerty	KeyJ	j	f	f	5	R
+en-qwerty	KeyK	k	f	f	6	R
+en-qwerty	KeyL	l	f	f	7	R
+en-qwerty	Semicolon	;	f	f	7	R
+en-qwerty	Quote	'	f	f	8	R
+en-qwerty	KeyZ	z	f	f	1	L
+en-qwerty	KeyX	x	f	f	2	L
+en-qwerty	KeyC	c	f	f	3	L
+en-qwerty	KeyV	v	f	f	4	L
+en-qwerty	KeyB	b	f	f	4	L
+en-qwerty	KeyN	n	f	f	5	R
+en-qwerty	KeyM	m	f	f	5	R
+en-qwerty	Comma	,	f	f	6	R
+en-qwerty	Period	.	f	f	7	R
+en-qwerty	Slash	/	f	f	8	R
+en-qwerty	Space	 	f	f	9	T
+ru-yucuen	Backquote	ё	f	f	1	L
+ru-yucuen	Digit1	1	f	f	1	L
+ru-yucuen	Digit2	2	f	f	2	L
+ru-yucuen	Digit3	3	f	f	3	L
+ru-yucuen	Digit4	4	f	f	4	L
+ru-yucuen	Digit5	5	f	f	4	L
+ru-yucuen	Digit6	6	f	f	5	R
+ru-yucuen	Digit7	7	f	f	5	R
+ru-yucuen	Digit8	8	f	f	6	R
+ru-yucuen	Digit9	9	f	f	7	R
+ru-yucuen	Digit0	0	f	f	8	R
+ru-yucuen	Minus	-	f	f	8	R
+ru-yucuen	Equal	=	f	f	8	R
+ru-yucuen	KeyQ	й	f	f	1	L
+ru-yucuen	KeyW	ц	f	f	2	L
+ru-yucuen	KeyE	у	f	f	3	L
+ru-yucuen	KeyR	к	f	f	4	L
+ru-yucuen	KeyT	е	f	f	4	L
+ru-yucuen	KeyY	н	f	f	5	R
+ru-yucuen	KeyU	г	f	f	5	R
+ru-yucuen	KeyI	ш	f	f	6	R
+ru-yucuen	KeyO	щ	f	f	7	R
+ru-yucuen	KeyP	з	f	f	8	R
+ru-yucuen	BracketLeft	х	f	f	8	R
+ru-yucuen	BracketRight	ъ	f	f	8	R
+ru-yucuen	Backslash	\\	f	f	8	R
+ru-yucuen	KeyA	ф	f	f	1	L
+ru-yucuen	KeyS	ы	f	f	2	L
+ru-yucuen	KeyD	в	f	f	3	L
+ru-yucuen	KeyF	а	f	f	4	L
+ru-yucuen	KeyG	п	f	f	4	L
+ru-yucuen	KeyH	р	f	f	5	R
+ru-yucuen	KeyJ	о	f	f	5	R
+ru-yucuen	KeyK	л	f	f	6	R
+ru-yucuen	KeyL	д	f	f	7	R
+ru-yucuen	Semicolon	ж	f	f	7	R
+ru-yucuen	Quote	э	f	f	8	R
+ru-yucuen	KeyZ	я	f	f	1	L
+ru-yucuen	KeyX	ч	f	f	2	L
+ru-yucuen	KeyC	с	f	f	3	L
+ru-yucuen	KeyV	м	f	f	4	L
+ru-yucuen	KeyB	и	f	f	4	L
+ru-yucuen	KeyN	т	f	f	5	R
+ru-yucuen	KeyM	ь	f	f	5	R
+ru-yucuen	Comma	б	f	f	6	R
+ru-yucuen	Period	ю	f	f	7	R
+ru-yucuen	Slash	.	f	f	8	R
+ru-yucuen	Space	 	f	f	9	T
+en-qwerty	Backquote	~	t	f	1	L
+en-qwerty	Digit1	!	t	f	1	L
+en-qwerty	Digit2	@	t	f	2	L
+en-qwerty	Digit3	#	t	f	3	L
+en-qwerty	Digit4	$	t	f	4	L
+en-qwerty	Digit5	%	t	f	4	L
+en-qwerty	Digit6	^	t	f	5	R
+en-qwerty	Digit7	&	t	f	5	R
+en-qwerty	Digit8	*	t	f	6	R
+en-qwerty	Digit9	(	t	f	7	R
+en-qwerty	Digit0	)	t	f	8	R
+en-qwerty	Minus	_	t	f	8	R
+en-qwerty	Equal	+	t	f	8	R
+en-qwerty	KeyQ	Q	t	f	1	L
+en-qwerty	KeyW	W	t	f	2	L
+en-qwerty	KeyE	E	t	f	3	L
+en-qwerty	KeyR	R	t	f	4	L
+en-qwerty	KeyT	T	t	f	4	L
+en-qwerty	KeyY	Y	t	f	5	R
+en-qwerty	KeyU	U	t	f	5	R
+en-qwerty	KeyI	I	t	f	6	R
+en-qwerty	KeyO	O	t	f	7	R
+en-qwerty	KeyP	P	t	f	8	R
+en-qwerty	BracketLeft	{	t	f	8	R
+en-qwerty	BracketRight	}	t	f	8	R
+en-qwerty	Backslash	|	t	f	8	R
+en-qwerty	KeyA	A	t	f	1	L
+en-qwerty	KeyS	S	t	f	2	L
+en-qwerty	KeyD	D	t	f	3	L
+en-qwerty	KeyF	F	t	f	4	L
+en-qwerty	KeyG	G	t	f	4	L
+en-qwerty	KeyH	H	t	f	5	R
+en-qwerty	KeyJ	J	t	f	5	R
+en-qwerty	KeyK	K	t	f	6	R
+en-qwerty	KeyL	L	t	f	7	R
+en-qwerty	Semicolon	:	t	f	7	R
+en-qwerty	Quote	"	t	f	8	R
+en-qwerty	KeyZ	Z	t	f	1	L
+en-qwerty	KeyX	X	t	f	2	L
+en-qwerty	KeyC	C	t	f	3	L
+en-qwerty	KeyV	V	t	f	4	L
+en-qwerty	KeyB	B	t	f	4	L
+en-qwerty	KeyN	N	t	f	5	R
+en-qwerty	KeyM	M	t	f	5	R
+en-qwerty	Comma	<	t	f	6	R
+en-qwerty	Period	>	t	f	7	R
+en-qwerty	Slash	?	t	f	8	R
+ru-yucuen	Backquote	Ё	t	f	1	L
+ru-yucuen	Digit1	!	t	f	1	L
+ru-yucuen	Digit2	"	t	f	2	L
+ru-yucuen	Digit3	№	t	f	3	L
+ru-yucuen	Digit4	;	t	f	4	L
+ru-yucuen	Digit5	%	t	f	4	L
+ru-yucuen	Digit6	:	t	f	5	R
+ru-yucuen	Digit7	?	t	f	5	R
+ru-yucuen	Digit8	*	t	f	6	R
+ru-yucuen	Digit9	(	t	f	7	R
+ru-yucuen	Digit0	)	t	f	8	R
+ru-yucuen	Minus	_	t	f	8	R
+ru-yucuen	Equal	+	t	f	8	R
+ru-yucuen	KeyQ	Й	t	f	1	L
+ru-yucuen	KeyW	Ц	t	f	2	L
+ru-yucuen	KeyE	У	t	f	3	L
+ru-yucuen	KeyR	К	t	f	4	L
+ru-yucuen	KeyT	Е	t	f	4	L
+ru-yucuen	KeyY	Н	t	f	5	R
+ru-yucuen	KeyU	Г	t	f	5	R
+ru-yucuen	KeyI	Ш	t	f	6	R
+ru-yucuen	KeyO	Щ	t	f	7	R
+ru-yucuen	KeyP	З	t	f	8	R
+ru-yucuen	BracketLeft	{	t	f	8	R
+ru-yucuen	BracketRight	}	t	f	8	R
+ru-yucuen	Backslash	|	t	f	8	R
+ru-yucuen	KeyA	Ф	t	f	1	L
+ru-yucuen	KeyS	Ы	t	f	2	L
+ru-yucuen	KeyD	В	t	f	3	L
+ru-yucuen	KeyF	А	t	f	4	L
+ru-yucuen	KeyG	П	t	f	4	L
+ru-yucuen	KeyH	Р	t	f	5	R
+ru-yucuen	KeyJ	О	t	f	5	R
+ru-yucuen	KeyK	Л	t	f	6	R
+ru-yucuen	KeyL	Д	t	f	7	R
+ru-yucuen	Semicolon	:	t	f	7	R
+ru-yucuen	Quote	"	t	f	8	R
+ru-yucuen	KeyZ	Я	t	f	1	L
+ru-yucuen	KeyX	Ч	t	f	2	L
+ru-yucuen	KeyC	С	t	f	3	L
+ru-yucuen	KeyV	М	t	f	4	L
+ru-yucuen	KeyB	И	t	f	4	L
+ru-yucuen	KeyN	Т	t	f	5	R
+ru-yucuen	KeyM	Ь	t	f	5	R
+ru-yucuen	Comma	,	t	f	6	R
+ru-yucuen	Period	.	t	f	7	R
+ru-yucuen	Slash	/	t	f	8	R
+\.
+
+
+--
+-- TOC entry 3955 (class 0 OID 16541)
+-- Dependencies: 220
+-- Data for Name: keyboard_layouts; Type: TABLE DATA; Schema: public; Owner: lab1
+--
+
+COPY public.keyboard_layouts (id, code, name, language_code, is_default, created_at) FROM stdin;
+en-qwerty	qwerty	English QWERTY	en	t	2026-10-19 20:42:08.745779+00
+ru-yucuen	yucuen	Russian ЙЦУКЕН	ru	f	2026-10-19 20:42:08.745779+00
+\.
+
+
+--
+-- TOC entry 3956 (class 0 OID 16557)
+-- Dependencies: 221
+-- Data for Name: keys; Type: TABLE DATA; Schema: public; Owner: lab1
+--
+
+COPY public.keys (key_code, row_no, col_no, width_units, key_type, created_at) FROM stdin;
+Backquote	0	0	1	printable	2026-10-19 20:42:08.745779+00
+Backslash	1	13	1.5	printable	2026-10-19 20:42:08.745779+00
+BracketLeft	1	11	1	printable	2026-10-19 20:42:08.745779+00
+BracketRight	1	12	1	printable	2026-10-19 20:42:08.745779+00
+Comma	3	8	1	printable	2026-10-19 20:42:08.745779+00
+Digit0	0	10	1	printable	2026-10-19 20:42:08.745779+00
+Digit1	0	1	1	printable	2026-10-19 20:42:08.745779+00
+Digit2	0	2	1	printable	2026-10-19 20:42:08.745779+00
+Digit3	0	3	1	printable	2026-10-19 20:42:08.745779+00
+Digit4	0	4	1	printable	2026-10-19 20:42:08.745779+00
+Digit5	0	5	1	printable	2026-10-19 20:42:08.745779+00
+Digit6	0	6	1	printable	2026-10-19 20:42:08.745779+00
+Digit7	0	7	1	printable	2026-10-19 20:42:08.745779+00
+Digit8	0	8	1	printable	2026-10-19 20:42:08.745779+00
+Digit9	0	9	1	printable	2026-10-19 20:42:08.745779+00
+Equal	0	12	1	printable	2026-10-19 20:42:08.745779+00
+KeyA	2	1	1	printable	2026-10-19 20:42:08.745779+00
+KeyB	3	5	1	printable	2026-10-19 20:42:08.745779+00
+KeyC	3	3	1	printable	2026-10-19 20:42:08.745779+00
+KeyD	2	3	1	printable	2026-10-19 20:42:08.745779+00
+KeyE	1	3	1	printable	2026-10-19 20:42:08.745779+00
+KeyF	2	4	1	printable	2026-10-19 20:42:08.745779+00
+KeyG	2	5	1	printable	2026-10-19 20:42:08.745779+00
+KeyH	2	6	1	printable	2026-10-19 20:42:08.745779+00
+KeyI	1	8	1	printable	2026-10-19 20:42:08.745779+00
+KeyJ	2	7	1	printable	2026-10-19 20:42:08.745779+00
+KeyK	2	8	1	printable	2026-10-19 20:42:08.745779+00
+KeyL	2	9	1	printable	2026-10-19 20:42:08.745779+00
+KeyM	3	7	1	printable	2026-10-19 20:42:08.745779+00
+KeyN	3	6	1	printable	2026-10-19 20:42:08.745779+00
+KeyO	1	9	1	printable	2026-10-19 20:42:08.745779+00
+KeyP	1	10	1	printable	2026-10-19 20:42:08.745779+00
+KeyQ	1	1	1	printable	2026-10-19 20:42:08.745779+00
+KeyR	1	4	1	printable	2026-10-19 20:42:08.745779+00
+KeyS	2	2	1	printable	2026-10-19 20:42:08.745779+00
+KeyT	1	5	1	printable	2026-10-19 20:42:08.745779+00
+KeyU	1	7	1	printable	2026-10-19 20:42:08.745779+00
+KeyV	3	4	1	printable	2026-10-19 20:42:08.745779+00
+KeyW	1	2	1	printable	2026-10-19 20:42:08.745779+00
+KeyX	3	2	1	printable	2026-10-19 20:42:08.745779+00
+KeyY	1	6	1	printable	2026-10-19 20:42:08.745779+00
+KeyZ	3	1	1	printable	2026-10-19 20:42:08.745779+00
+Minus	0	11	1	printable	2026-10-19 20:42:08.745779+00
+Period	3	9	1	printable	2026-10-19 20:42:08.745779+00
+Quote	2	12	1	printable	2026-10-19 20:42:08.745779+00
+Semicolon	2	11	1	printable	2026-10-19 20:42:08.745779+00
+Slash	3	10	1	printable	2026-10-19 20:42:08.745779+00
+Space	4	3	6.25	space	2026-10-19 20:42:08.745779+00
+\.
+
+
+--
+-- TOC entry 3954 (class 0 OID 16532)
+-- Dependencies: 219
+-- Data for Name: languages; Type: TABLE DATA; Schema: public; Owner: lab1
+--
+
+COPY public.languages (code, name, native_name, created_at) FROM stdin;
+ru	Russian	Русский	2026-10-19 20:42:08.745779+00
+en	English	English	2026-10-19 20:42:08.745779+00
+\.
+
+
+--
+-- TOC entry 3971 (class 0 OID 16771)
+-- Dependencies: 236
+-- Data for Name: levels; Type: TABLE DATA; Schema: public; Owner: lab1
+--
+
+COPY public.levels (level, title, xp_required, unlocks_modes, bonus_multiplier, color, icon, description, created_at) FROM stdin;
+1	Новичок	0	{words,symbols}	1.00	#94a3b8	🌱	Базовые слова и простые символы	2026-10-19 20:42:08.745779+00
+2	Ученик	100	{words,symbols}	1.00	#60a5fa	✏️	Первые уверенные результаты	2026-10-19 20:42:08.745779+00
+3	Практикант	250	{words,sentences,symbols}	1.00	#22d3ee	📘	Открываются предложения	2026-10-19 20:42:08.745779+00
+4	Оператор	500	{words,sentences,symbols}	1.05	#34d399	⌨️	Стабильная скорость	2026-10-19 20:42:08.745779+00
+5	Скоростной	900	{words,sentences,code,symbols}	1.05	#a3e635	🚀	Открывается режим кода	2026-10-19 20:42:08.745779+00
+6	Виртуоз	1500	{words,sentences,code,symbols}	1.10	#facc15	✨	Высокий темп печати	2026-10-19 20:42:08.745779+00
+7	Мастер	2500	{words,sentences,code,symbols}	1.10	#fb923c	🔥	Уверенная слепая печать	2026-10-19 20:42:08.745779+00
+8	Эксперт	4000	{words,sentences,code,symbols}	1.15	#f472b6	🎯	Сложные символы и точность	2026-10-19 20:42:08.745779+00
+9	Профи	6500	{words,sentences,code,symbols}	1.15	#c084fc	🏆	Профессиональный уровень	2026-10-19 20:42:08.745779+00
+10	Легенда	10000	{words,sentences,code,symbols}	1.20	#22c55e	👑	Все режимы открыты	2026-10-19 20:42:08.745779+00
+11	Киберпалец	15000	{words,sentences,code,symbols}	1.25	#06b6d4	🤖	Быстрые и точные сессии	2026-10-19 20:42:08.745779+00
+12	Печатный маг	22000	{words,sentences,code,symbols}	1.30	#8b5cf6	🪄	Редкие бонусы и комбо	2026-10-19 20:42:08.745779+00
+13	Виртуоз кода	32000	{words,sentences,code,symbols}	1.35	#eab308	💻	Специализация на коде	2026-10-19 20:42:08.745779+00
+14	Мастер потока	45000	{words,sentences,code,symbols}	1.40	#ef4444	🌊	Максимальные серии	2026-10-19 20:42:08.745779+00
+15	Легенда клавиатуры	60000	{words,sentences,code,symbols}	1.50	#ffffff	🌟	Высший уровень тренажёра	2026-10-19 20:42:08.745779+00
+\.
+
+
+--
+-- TOC entry 3968 (class 0 OID 16707)
+-- Dependencies: 233
+-- Data for Name: oauth_accounts; Type: TABLE DATA; Schema: public; Owner: lab1
+--
+
+COPY public.oauth_accounts (id, user_id, provider, provider_user_id, access_token, refresh_token, expires_at, scopes, created_at) FROM stdin;
+\.
+
+
+--
+-- TOC entry 3969 (class 0 OID 16725)
+-- Dependencies: 234
+-- Data for Name: refresh_tokens; Type: TABLE DATA; Schema: public; Owner: lab1
+--
+
+COPY public.refresh_tokens (id, user_id, token_hash, expires_at, revoked_at, created_at, ip, user_agent) FROM stdin;
+\.
+
+
+--
+-- TOC entry 3962 (class 0 OID 16631)
+-- Dependencies: 227
+-- Data for Name: sentences; Type: TABLE DATA; Schema: public; Owner: lab1
+--
+
+COPY public.sentences (id, language_code, text, difficulty, created_at) FROM stdin;
+1	en	The quick brown fox jumps over the lazy dog.	2	2026-10-19 20:42:08.745779+00
+2	en	Practice makes perfect when you type every day.	2	2026-10-19 20:42:08.745779+00
+3	en	Silent words hide powerful meaning in simple letters.	2	2026-10-19 20:42:08.745779+00
+4	en	Keyboard shortcuts can save a lot of time.	2	2026-10-19 20:42:08.745779+00
+5	en	Focus on rhythm rather than raw speed first.	2	2026-10-19 20:42:08.745779+00
+6	en	Accuracy builds confidence and speed follows naturally.	2	2026-10-19 20:42:08.745779+00
+7	en	Developers read code more often than they write it.	2	2026-10-19 20:42:08.745779+00
+8	en	A good habit is worth more than a brilliant one.	2	2026-10-19 20:42:08.745779+00
+9	ru	Быстрая коричневая лиса прыгает через ленивого пса.	2	2026-10-19 20:42:08.745779+00
+10	ru	Практика каждый день делает печать уверенной.	2	2026-10-19 20:42:08.745779+00
+11	ru	Сначала точность, потом скорость — главный принцип.	2	2026-10-19 20:42:08.745779+00
+12	ru	Клавиатурные сокращения экономят много времени.	2	2026-10-19 20:42:08.745779+00
+13	ru	Слепая печать освобождает взгляд для мышления.	2	2026-10-19 20:42:08.745779+00
+14	ru	Ритм важнее рывков в начале тренировки.	2	2026-10-19 20:42:08.745779+00
+15	ru	Развивайте мышцы памяти, а не только пальцы.	2	2026-10-19 20:42:08.745779+00
+16	ru	Код читают чаще, чем пишут, поэтому важна ясность.	2	2026-10-19 20:42:08.745779+00
+\.
+
+
+--
+-- TOC entry 3982 (class 0 OID 17045)
+-- Dependencies: 247
+-- Data for Name: session_bonus_activations; Type: TABLE DATA; Schema: public; Owner: lab1
+--
+
+COPY public.session_bonus_activations (id, session_id, bonus_code, activated_at, duration_seconds, effect, source, metadata) FROM stdin;
+\.
+
+
+--
+-- TOC entry 3975 (class 0 OID 16888)
+-- Dependencies: 240
+-- Data for Name: session_events; Type: TABLE DATA; Schema: public; Owner: lab1
+--
+
+COPY public.session_events (id, session_id, seq, occurred_at, event_type, key_code, expected_char, actual_char, is_correct, combo_before, combo_after, score_delta, xp_delta, metadata) FROM stdin;
+\.
+
+
+--
+-- TOC entry 3973 (class 0 OID 16824)
+-- Dependencies: 238
+-- Data for Name: sessions; Type: TABLE DATA; Schema: public; Owner: lab1
+--
+
+COPY public.sessions (id, user_id, anonymous_id, mode_code, language_code, keyboard_layout_id, started_at, ended_at, duration_seconds, status, total_chars, correct_chars, incorrect_chars, missed_chars, accuracy, wpm, cpm, max_combo, score, xp_earned, level_before, level_after, anti_cheat, metadata, created_at, updated_at) FROM stdin;
+\.
+
+
+--
+-- TOC entry 3966 (class 0 OID 16667)
+-- Dependencies: 231
+-- Data for Name: symbol_sets; Type: TABLE DATA; Schema: public; Owner: lab1
+--
+
+COPY public.symbol_sets (id, name, chars, difficulty, language_code, created_at) FROM stdin;
+1	Basic punctuation	.,!?;:	1	\N	2026-10-19 20:42:08.745779+00
+2	Digits and symbols	0123456789!@#$%^&*()	2	\N	2026-10-19 20:42:08.745779+00
+3	Code symbols	{}[]();:=<>+-*/&|!?#$	3	\N	2026-10-19 20:42:08.745779+00
+4	Russian uppercase	АБВГДЕЁЖЗИЙКЛМНОПРСТУФХЦЧШЩЪЫЬЭЮЯ	2	ru	2026-10-19 20:42:08.745779+00
+5	English uppercase	ABCDEFGHIJKLMNOPQRSTUVWXYZ	2	en	2026-10-19 20:42:08.745779+00
+6	Mixed hard	QZXJVK#$_&@!1098	3	\N	2026-10-19 20:42:08.745779+00
+\.
+
+
+--
+-- TOC entry 3978 (class 0 OID 16964)
+-- Dependencies: 243
+-- Data for Name: user_achievements; Type: TABLE DATA; Schema: public; Owner: lab1
+--
+
+COPY public.user_achievements (user_id, achievement_code, progress_value, target_value, completed, unlocked_at, metadata, updated_at) FROM stdin;
+\.
+
+
+--
+-- TOC entry 3980 (class 0 OID 17015)
+-- Dependencies: 245
+-- Data for Name: user_active_bonuses; Type: TABLE DATA; Schema: public; Owner: lab1
+--
+
+COPY public.user_active_bonuses (id, user_id, bonus_code, session_id, started_at, expires_at, effect_snapshot, status, metadata) FROM stdin;
+\.
+
+
+--
+-- TOC entry 3972 (class 0 OID 16786)
+-- Dependencies: 237
+-- Data for Name: user_progress; Type: TABLE DATA; Schema: public; Owner: lab1
+--
+
+COPY public.user_progress (user_id, total_xp, level, total_sessions, total_time_seconds, total_chars, correct_chars, incorrect_chars, best_wpm, best_cpm, best_accuracy, longest_combo, streak_days, last_session_date, updated_at) FROM stdin;
+\.
+
+
+--
+-- TOC entry 3970 (class 0 OID 16742)
+-- Dependencies: 235
+-- Data for Name: user_settings; Type: TABLE DATA; Schema: public; Owner: lab1
+--
+
+COPY public.user_settings (user_id, keyboard_layout_id, sound_enabled, visual_effects, reduced_motion, theme, show_keyboard_hint, highlight_style, daily_goal_minutes, updated_at) FROM stdin;
+\.
+
+
+--
+-- TOC entry 3967 (class 0 OID 16686)
+-- Dependencies: 232
+-- Data for Name: users; Type: TABLE DATA; Schema: public; Owner: lab1
+--
+
+COPY public.users (id, email, password_hash, display_name, avatar_url, timezone, locale, is_active, is_email_verified, role, created_at, updated_at, last_login_at) FROM stdin;
+\.
+
+
+--
+-- TOC entry 3960 (class 0 OID 16609)
+-- Dependencies: 225
+-- Data for Name: words; Type: TABLE DATA; Schema: public; Owner: lab1
+--
+
+COPY public.words (id, language_code, word, frequency, difficulty, created_at) FROM stdin;
+1	en	the	100	1	2026-10-19 20:42:08.745779+00
+2	en	be	100	1	2026-10-19 20:42:08.745779+00
+3	en	to	100	1	2026-10-19 20:42:08.745779+00
+4	en	of	100	1	2026-10-19 20:42:08.745779+00
+5	en	and	100	1	2026-10-19 20:42:08.745779+00
+6	en	a	100	1	2026-10-19 20:42:08.745779+00
+7	en	in	100	1	2026-10-19 20:42:08.745779+00
+8	en	that	100	1	2026-10-19 20:42:08.745779+00
+9	en	have	100	1	2026-10-19 20:42:08.745779+00
+10	en	it	100	1	2026-10-19 20:42:08.745779+00
+11	en	for	100	1	2026-10-19 20:42:08.745779+00
+12	en	not	100	1	2026-10-19 20:42:08.745779+00
+13	en	on	100	1	2026-10-19 20:42:08.745779+00
+14	en	with	100	1	2026-10-19 20:42:08.745779+00
+15	en	he	100	1	2026-10-19 20:42:08.745779+00
+16	en	as	100	1	2026-10-19 20:42:08.745779+00
+17	en	you	100	1	2026-10-19 20:42:08.745779+00
+18	en	do	100	1	2026-10-19 20:42:08.745779+00
+19	en	at	100	1	2026-10-19 20:42:08.745779+00
+20	en	this	100	1	2026-10-19 20:42:08.745779+00
+21	en	but	100	1	2026-10-19 20:42:08.745779+00
+22	en	his	100	1	2026-10-19 20:42:08.745779+00
+23	en	by	100	1	2026-10-19 20:42:08.745779+00
+24	en	from	100	1	2026-10-19 20:42:08.745779+00
+25	en	they	100	1	2026-10-19 20:42:08.745779+00
+26	en	we	100	1	2026-10-19 20:42:08.745779+00
+27	en	say	100	1	2026-10-19 20:42:08.745779+00
+28	en	her	100	1	2026-10-19 20:42:08.745779+00
+29	en	she	100	1	2026-10-19 20:42:08.745779+00
+30	en	or	100	1	2026-10-19 20:42:08.745779+00
+31	en	an	100	1	2026-10-19 20:42:08.745779+00
+32	en	will	100	1	2026-10-19 20:42:08.745779+00
+33	en	my	100	1	2026-10-19 20:42:08.745779+00
+34	en	one	100	1	2026-10-19 20:42:08.745779+00
+35	en	all	100	1	2026-10-19 20:42:08.745779+00
+36	en	would	100	1	2026-10-19 20:42:08.745779+00
+37	en	there	100	1	2026-10-19 20:42:08.745779+00
+38	en	their	100	1	2026-10-19 20:42:08.745779+00
+39	en	what	100	1	2026-10-19 20:42:08.745779+00
+40	en	so	100	1	2026-10-19 20:42:08.745779+00
+41	en	up	100	1	2026-10-19 20:42:08.745779+00
+42	en	out	100	1	2026-10-19 20:42:08.745779+00
+43	en	if	100	1	2026-10-19 20:42:08.745779+00
+44	en	about	100	1	2026-10-19 20:42:08.745779+00
+45	en	who	100	1	2026-10-19 20:42:08.745779+00
+46	en	get	100	1	2026-10-19 20:42:08.745779+00
+47	en	which	100	1	2026-10-19 20:42:08.745779+00
+48	en	go	100	1	2026-10-19 20:42:08.745779+00
+49	en	me	100	1	2026-10-19 20:42:08.745779+00
+50	en	use	100	1	2026-10-19 20:42:08.745779+00
+51	ru	и	100	1	2026-10-19 20:42:08.745779+00
+52	ru	в	100	1	2026-10-19 20:42:08.745779+00
+53	ru	во	100	1	2026-10-19 20:42:08.745779+00
+54	ru	что	100	1	2026-10-19 20:42:08.745779+00
+55	ru	не	100	1	2026-10-19 20:42:08.745779+00
+56	ru	он	100	1	2026-10-19 20:42:08.745779+00
+57	ru	на	100	1	2026-10-19 20:42:08.745779+00
+58	ru	я	100	1	2026-10-19 20:42:08.745779+00
+59	ru	с	100	1	2026-10-19 20:42:08.745779+00
+60	ru	со	100	1	2026-10-19 20:42:08.745779+00
+61	ru	как	100	1	2026-10-19 20:42:08.745779+00
+62	ru	а	100	1	2026-10-19 20:42:08.745779+00
+63	ru	то	100	1	2026-10-19 20:42:08.745779+00
+64	ru	все	100	1	2026-10-19 20:42:08.745779+00
+65	ru	она	100	1	2026-10-19 20:42:08.745779+00
+66	ru	так	100	1	2026-10-19 20:42:08.745779+00
+67	ru	его	100	1	2026-10-19 20:42:08.745779+00
+68	ru	но	100	1	2026-10-19 20:42:08.745779+00
+69	ru	да	100	1	2026-10-19 20:42:08.745779+00
+70	ru	ты	100	1	2026-10-19 20:42:08.745779+00
+71	ru	к	100	1	2026-10-19 20:42:08.745779+00
+72	ru	у	100	1	2026-10-19 20:42:08.745779+00
+73	ru	же	100	1	2026-10-19 20:42:08.745779+00
+74	ru	вы	100	1	2026-10-19 20:42:08.745779+00
+75	ru	за	100	1	2026-10-19 20:42:08.745779+00
+76	ru	бы	100	1	2026-10-19 20:42:08.745779+00
+77	ru	по	100	1	2026-10-19 20:42:08.745779+00
+78	ru	только	100	1	2026-10-19 20:42:08.745779+00
+79	ru	её	100	1	2026-10-19 20:42:08.745779+00
+80	ru	мне	100	1	2026-10-19 20:42:08.745779+00
+81	ru	было	100	1	2026-10-19 20:42:08.745779+00
+82	ru	уже	100	1	2026-10-19 20:42:08.745779+00
+83	ru	или	100	1	2026-10-19 20:42:08.745779+00
+84	ru	ни	100	1	2026-10-19 20:42:08.745779+00
+85	ru	быть	100	1	2026-10-19 20:42:08.745779+00
+86	ru	они	100	1	2026-10-19 20:42:08.745779+00
+87	ru	это	100	1	2026-10-19 20:42:08.745779+00
+88	ru	мы	100	1	2026-10-19 20:42:08.745779+00
+89	ru	вас	100	1	2026-10-19 20:42:08.745779+00
+90	ru	год	100	1	2026-10-19 20:42:08.745779+00
+\.
+
+
+--
+-- TOC entry 3997 (class 0 OID 0)
+-- Dependencies: 228
+-- Name: code_snippets_id_seq; Type: SEQUENCE SET; Schema: public; Owner: lab1
+--
+
+SELECT pg_catalog.setval('public.code_snippets_id_seq', 9, true);
+
+
+--
+-- TOC entry 3998 (class 0 OID 0)
+-- Dependencies: 226
+-- Name: sentences_id_seq; Type: SEQUENCE SET; Schema: public; Owner: lab1
+--
+
+SELECT pg_catalog.setval('public.sentences_id_seq', 16, true);
+
+
+--
+-- TOC entry 3999 (class 0 OID 0)
+-- Dependencies: 246
+-- Name: session_bonus_activations_id_seq; Type: SEQUENCE SET; Schema: public; Owner: lab1
+--
+
+SELECT pg_catalog.setval('public.session_bonus_activations_id_seq', 1, false);
+
+
+--
+-- TOC entry 4000 (class 0 OID 0)
+-- Dependencies: 239
+-- Name: session_events_id_seq; Type: SEQUENCE SET; Schema: public; Owner: lab1
+--
+
+SELECT pg_catalog.setval('public.session_events_id_seq', 1, false);
+
+
+--
+-- TOC entry 4001 (class 0 OID 0)
+-- Dependencies: 230
+-- Name: symbol_sets_id_seq; Type: SEQUENCE SET; Schema: public; Owner: lab1
+--
+
+SELECT pg_catalog.setval('public.symbol_sets_id_seq', 6, true);
+
+
+--
+-- TOC entry 4002 (class 0 OID 0)
+-- Dependencies: 224
+-- Name: words_id_seq; Type: SEQUENCE SET; Schema: public; Owner: lab1
+--
+
+SELECT pg_catalog.setval('public.words_id_seq', 90, true);
+
+
+--
+-- TOC entry 3761 (class 2606 OID 16958)
+-- Name: achievements achievements_pkey; Type: CONSTRAINT; Schema: public; Owner: lab1
+--
+
+ALTER TABLE ONLY public.achievements
+    ADD CONSTRAINT achievements_pkey PRIMARY KEY (code);
+
+
+--
+-- TOC entry 3766 (class 2606 OID 17009)
+-- Name: bonus_definitions bonus_definitions_pkey; Type: CONSTRAINT; Schema: public; Owner: lab1
+--
+
+ALTER TABLE ONLY public.bonus_definitions
+    ADD CONSTRAINT bonus_definitions_pkey PRIMARY KEY (code);
+
+
+--
+-- TOC entry 3758 (class 2606 OID 16935)
+-- Name: character_stats character_stats_pkey; Type: CONSTRAINT; Schema: public; Owner: lab1
+--
+
+ALTER TABLE ONLY public.character_stats
+    ADD CONSTRAINT character_stats_pkey PRIMARY KEY (user_id, "char");
+
+
+--
+-- TOC entry 3712 (class 2606 OID 16663)
+-- Name: code_snippets code_snippets_pkey; Type: CONSTRAINT; Schema: public; Owner: lab1
+--
+
+ALTER TABLE ONLY public.code_snippets
+    ADD CONSTRAINT code_snippets_pkey PRIMARY KEY (id);
+
+
+--
+-- TOC entry 3714 (class 2606 OID 16665)
+-- Name: code_snippets code_snippets_programming_language_code_key; Type: CONSTRAINT; Schema: public; Owner: lab1
+--
+
+ALTER TABLE ONLY public.code_snippets
+    ADD CONSTRAINT code_snippets_programming_language_code_key UNIQUE (programming_language, code);
+
+
+--
+-- TOC entry 3701 (class 2606 OID 16602)
+-- Name: exercise_modes exercise_modes_pkey; Type: CONSTRAINT; Schema: public; Owner: lab1
+--
+
+ALTER TABLE ONLY public.exercise_modes
+    ADD CONSTRAINT exercise_modes_pkey PRIMARY KEY (code);
+
+
+--
+-- TOC entry 3699 (class 2606 OID 16579)
+-- Name: key_variants key_variants_pkey; Type: CONSTRAINT; Schema: public; Owner: lab1
+--
+
+ALTER TABLE ONLY public.key_variants
+    ADD CONSTRAINT key_variants_pkey PRIMARY KEY (layout_id, key_code, shift, altgr);
+
+
+--
+-- TOC entry 3692 (class 2606 OID 16551)
+-- Name: keyboard_layouts keyboard_layouts_code_key; Type: CONSTRAINT; Schema: public; Owner: lab1
+--
+
+ALTER TABLE ONLY public.keyboard_layouts
+    ADD CONSTRAINT keyboard_layouts_code_key UNIQUE (code);
+
+
+--
+-- TOC entry 3694 (class 2606 OID 16549)
+-- Name: keyboard_layouts keyboard_layouts_pkey; Type: CONSTRAINT; Schema: public; Owner: lab1
+--
+
+ALTER TABLE ONLY public.keyboard_layouts
+    ADD CONSTRAINT keyboard_layouts_pkey PRIMARY KEY (id);
+
+
+--
+-- TOC entry 3696 (class 2606 OID 16567)
+-- Name: keys keys_pkey; Type: CONSTRAINT; Schema: public; Owner: lab1
+--
+
+ALTER TABLE ONLY public.keys
+    ADD CONSTRAINT keys_pkey PRIMARY KEY (key_code);
+
+
+--
+-- TOC entry 3690 (class 2606 OID 16540)
+-- Name: languages languages_pkey; Type: CONSTRAINT; Schema: public; Owner: lab1
+--
+
+ALTER TABLE ONLY public.languages
+    ADD CONSTRAINT languages_pkey PRIMARY KEY (code);
+
+
+--
+-- TOC entry 3737 (class 2606 OID 16783)
+-- Name: levels levels_pkey; Type: CONSTRAINT; Schema: public; Owner: lab1
+--
+
+ALTER TABLE ONLY public.levels
+    ADD CONSTRAINT levels_pkey PRIMARY KEY (level);
+
+
+--
+-- TOC entry 3739 (class 2606 OID 16785)
+-- Name: levels levels_xp_required_key; Type: CONSTRAINT; Schema: public; Owner: lab1
+--
+
+ALTER TABLE ONLY public.levels
+    ADD CONSTRAINT levels_xp_required_key UNIQUE (xp_required);
+
+
+--
+-- TOC entry 3726 (class 2606 OID 16716)
+-- Name: oauth_accounts oauth_accounts_pkey; Type: CONSTRAINT; Schema: public; Owner: lab1
+--
+
+ALTER TABLE ONLY public.oauth_accounts
+    ADD CONSTRAINT oauth_accounts_pkey PRIMARY KEY (id);
+
+
+--
+-- TOC entry 3728 (class 2606 OID 16718)
+-- Name: oauth_accounts oauth_accounts_provider_provider_user_id_key; Type: CONSTRAINT; Schema: public; Owner: lab1
+--
+
+ALTER TABLE ONLY public.oauth_accounts
+    ADD CONSTRAINT oauth_accounts_provider_provider_user_id_key UNIQUE (provider, provider_user_id);
+
+
+--
+-- TOC entry 3731 (class 2606 OID 16733)
+-- Name: refresh_tokens refresh_tokens_pkey; Type: CONSTRAINT; Schema: public; Owner: lab1
+--
+
+ALTER TABLE ONLY public.refresh_tokens
+    ADD CONSTRAINT refresh_tokens_pkey PRIMARY KEY (id);
+
+
+--
+-- TOC entry 3733 (class 2606 OID 16735)
+-- Name: refresh_tokens refresh_tokens_token_hash_key; Type: CONSTRAINT; Schema: public; Owner: lab1
+--
+
+ALTER TABLE ONLY public.refresh_tokens
+    ADD CONSTRAINT refresh_tokens_token_hash_key UNIQUE (token_hash);
+
+
+--
+-- TOC entry 3708 (class 2606 OID 16644)
+-- Name: sentences sentences_language_code_text_key; Type: CONSTRAINT; Schema: public; Owner: lab1
+--
+
+ALTER TABLE ONLY public.sentences
+    ADD CONSTRAINT sentences_language_code_text_key UNIQUE (language_code, text);
+
+
+--
+-- TOC entry 3710 (class 2606 OID 16642)
+-- Name: sentences sentences_pkey; Type: CONSTRAINT; Schema: public; Owner: lab1
+--
+
+ALTER TABLE ONLY public.sentences
+    ADD CONSTRAINT sentences_pkey PRIMARY KEY (id);
+
+
+--
+-- TOC entry 3772 (class 2606 OID 17057)
+-- Name: session_bonus_activations session_bonus_activations_pkey; Type: CONSTRAINT; Schema: public; Owner: lab1
+--
+
+ALTER TABLE ONLY public.session_bonus_activations
+    ADD CONSTRAINT session_bonus_activations_pkey PRIMARY KEY (id);
+
+
+--
+-- TOC entry 3754 (class 2606 OID 16901)
+-- Name: session_events session_events_pkey; Type: CONSTRAINT; Schema: public; Owner: lab1
+--
+
+ALTER TABLE ONLY public.session_events
+    ADD CONSTRAINT session_events_pkey PRIMARY KEY (id);
+
+
+--
+-- TOC entry 3756 (class 2606 OID 16903)
+-- Name: session_events session_events_session_id_seq_key; Type: CONSTRAINT; Schema: public; Owner: lab1
+--
+
+ALTER TABLE ONLY public.session_events
+    ADD CONSTRAINT session_events_session_id_seq_key UNIQUE (session_id, seq);
+
+
+--
+-- TOC entry 3750 (class 2606 OID 16862)
+-- Name: sessions sessions_pkey; Type: CONSTRAINT; Schema: public; Owner: lab1
+--
+
+ALTER TABLE ONLY public.sessions
+    ADD CONSTRAINT sessions_pkey PRIMARY KEY (id);
+
+
+--
+-- TOC entry 3716 (class 2606 OID 16680)
+-- Name: symbol_sets symbol_sets_name_key; Type: CONSTRAINT; Schema: public; Owner: lab1
+--
+
+ALTER TABLE ONLY public.symbol_sets
+    ADD CONSTRAINT symbol_sets_name_key UNIQUE (name);
+
+
+--
+-- TOC entry 3718 (class 2606 OID 16678)
+-- Name: symbol_sets symbol_sets_pkey; Type: CONSTRAINT; Schema: public; Owner: lab1
+--
+
+ALTER TABLE ONLY public.symbol_sets
+    ADD CONSTRAINT symbol_sets_pkey PRIMARY KEY (id);
+
+
+--
+-- TOC entry 3764 (class 2606 OID 16977)
+-- Name: user_achievements user_achievements_pkey; Type: CONSTRAINT; Schema: public; Owner: lab1
+--
+
+ALTER TABLE ONLY public.user_achievements
+    ADD CONSTRAINT user_achievements_pkey PRIMARY KEY (user_id, achievement_code);
+
+
+--
+-- TOC entry 3769 (class 2606 OID 17027)
+-- Name: user_active_bonuses user_active_bonuses_pkey; Type: CONSTRAINT; Schema: public; Owner: lab1
+--
+
+ALTER TABLE ONLY public.user_active_bonuses
+    ADD CONSTRAINT user_active_bonuses_pkey PRIMARY KEY (id);
+
+
+--
+-- TOC entry 3745 (class 2606 OID 16809)
+-- Name: user_progress user_progress_pkey; Type: CONSTRAINT; Schema: public; Owner: lab1
+--
+
+ALTER TABLE ONLY public.user_progress
+    ADD CONSTRAINT user_progress_pkey PRIMARY KEY (user_id);
+
+
+--
+-- TOC entry 3735 (class 2606 OID 16759)
+-- Name: user_settings user_settings_pkey; Type: CONSTRAINT; Schema: public; Owner: lab1
+--
+
+ALTER TABLE ONLY public.user_settings
+    ADD CONSTRAINT user_settings_pkey PRIMARY KEY (user_id);
+
+
+--
+-- TOC entry 3721 (class 2606 OID 16704)
+-- Name: users users_email_key; Type: CONSTRAINT; Schema: public; Owner: lab1
+--
+
+ALTER TABLE ONLY public.users
+    ADD CONSTRAINT users_email_key UNIQUE (email);
+
+
+--
+-- TOC entry 3723 (class 2606 OID 16702)
+-- Name: users users_pkey; Type: CONSTRAINT; Schema: public; Owner: lab1
+--
+
+ALTER TABLE ONLY public.users
+    ADD CONSTRAINT users_pkey PRIMARY KEY (id);
+
+
+--
+-- TOC entry 3704 (class 2606 OID 16623)
+-- Name: words words_language_code_word_key; Type: CONSTRAINT; Schema: public; Owner: lab1
+--
+
+ALTER TABLE ONLY public.words
+    ADD CONSTRAINT words_language_code_word_key UNIQUE (language_code, word);
+
+
+--
+-- TOC entry 3706 (class 2606 OID 16621)
+-- Name: words words_pkey; Type: CONSTRAINT; Schema: public; Owner: lab1
+--
+
+ALTER TABLE ONLY public.words
+    ADD CONSTRAINT words_pkey PRIMARY KEY (id);
+
+
+--
+-- TOC entry 3759 (class 1259 OID 16941)
+-- Name: idx_character_stats_errors; Type: INDEX; Schema: public; Owner: lab1
+--
+
+CREATE INDEX idx_character_stats_errors ON public.character_stats USING btree (user_id, incorrect DESC);
+
+
+--
+-- TOC entry 3697 (class 1259 OID 16590)
+-- Name: idx_key_variants_char; Type: INDEX; Schema: public; Owner: lab1
+--
+
+CREATE INDEX idx_key_variants_char ON public.key_variants USING btree (layout_id, "char", shift, altgr);
+
+
+--
+-- TOC entry 3724 (class 1259 OID 16724)
+-- Name: idx_oauth_user; Type: INDEX; Schema: public; Owner: lab1
+--
+
+CREATE INDEX idx_oauth_user ON public.oauth_accounts USING btree (user_id);
+
+
+--
+-- TOC entry 3729 (class 1259 OID 16741)
+-- Name: idx_refresh_user; Type: INDEX; Schema: public; Owner: lab1
+--
+
+CREATE INDEX idx_refresh_user ON public.refresh_tokens USING btree (user_id, expires_at);
+
+
+--
+-- TOC entry 3770 (class 1259 OID 17068)
+-- Name: idx_session_bonus_session; Type: INDEX; Schema: public; Owner: lab1
+--
+
+CREATE INDEX idx_session_bonus_session ON public.session_bonus_activations USING btree (session_id, activated_at);
+
+
+--
+-- TOC entry 3751 (class 1259 OID 16914)
+-- Name: idx_session_events_session_time; Type: INDEX; Schema: public; Owner: lab1
+--
+
+CREATE INDEX idx_session_events_session_time ON public.session_events USING btree (session_id, occurred_at);
+
+
+--
+-- TOC entry 3752 (class 1259 OID 16915)
+-- Name: idx_session_events_type; Type: INDEX; Schema: public; Owner: lab1
+--
+
+CREATE INDEX idx_session_events_type ON public.session_events USING btree (event_type);
+
+
+--
+-- TOC entry 3746 (class 1259 OID 16885)
+-- Name: idx_sessions_completed_ended; Type: INDEX; Schema: public; Owner: lab1
+--
+
+CREATE INDEX idx_sessions_completed_ended ON public.sessions USING btree (ended_at DESC) WHERE (status = 'completed'::text);
+
+
+--
+-- TOC entry 3747 (class 1259 OID 16884)
+-- Name: idx_sessions_mode_ended; Type: INDEX; Schema: public; Owner: lab1
+--
+
+CREATE INDEX idx_sessions_mode_ended ON public.sessions USING btree (mode_code, ended_at DESC);
+
+
+--
+-- TOC entry 3748 (class 1259 OID 16883)
+-- Name: idx_sessions_user_status; Type: INDEX; Schema: public; Owner: lab1
+--
+
+CREATE INDEX idx_sessions_user_status ON public.sessions USING btree (user_id, status, ended_at DESC);
+
+
+--
+-- TOC entry 3762 (class 1259 OID 16988)
+-- Name: idx_user_achievements_completed; Type: INDEX; Schema: public; Owner: lab1
+--
+
+CREATE INDEX idx_user_achievements_completed ON public.user_achievements USING btree (user_id, completed, unlocked_at DESC);
+
+
+--
+-- TOC entry 3767 (class 1259 OID 17043)
+-- Name: idx_user_active_bonuses; Type: INDEX; Schema: public; Owner: lab1
+--
+
+CREATE INDEX idx_user_active_bonuses ON public.user_active_bonuses USING btree (user_id, status, expires_at);
+
+
+--
+-- TOC entry 3740 (class 1259 OID 16823)
+-- Name: idx_user_progress_accuracy; Type: INDEX; Schema: public; Owner: lab1
+--
+
+CREATE INDEX idx_user_progress_accuracy ON public.user_progress USING btree (best_accuracy DESC);
+
+
+--
+-- TOC entry 3741 (class 1259 OID 16822)
+-- Name: idx_user_progress_cpm; Type: INDEX; Schema: public; Owner: lab1
+--
+
+CREATE INDEX idx_user_progress_cpm ON public.user_progress USING btree (best_cpm DESC);
+
+
+--
+-- TOC entry 3742 (class 1259 OID 16821)
+-- Name: idx_user_progress_wpm; Type: INDEX; Schema: public; Owner: lab1
+--
+
+CREATE INDEX idx_user_progress_wpm ON public.user_progress USING btree (best_wpm DESC);
+
+
+--
+-- TOC entry 3743 (class 1259 OID 16820)
+-- Name: idx_user_progress_xp; Type: INDEX; Schema: public; Owner: lab1
+--
+
+CREATE INDEX idx_user_progress_xp ON public.user_progress USING btree (total_xp DESC);
+
+
+--
+-- TOC entry 3719 (class 1259 OID 16705)
+-- Name: idx_users_email; Type: INDEX; Schema: public; Owner: lab1
+--
+
+CREATE INDEX idx_users_email ON public.users USING btree (email);
+
+
+--
+-- TOC entry 3702 (class 1259 OID 16629)
+-- Name: idx_words_lang_diff_length; Type: INDEX; Schema: public; Owner: lab1
+--
+
+CREATE INDEX idx_words_lang_diff_length ON public.words USING btree (language_code, difficulty, length);
+
+
+--
+-- TOC entry 3807 (class 2620 OID 16942)
+-- Name: character_stats trg_character_stats_updated; Type: TRIGGER; Schema: public; Owner: lab1
+--
+
+CREATE TRIGGER trg_character_stats_updated BEFORE UPDATE ON public.character_stats FOR EACH ROW EXECUTE FUNCTION public.set_updated_at();
+
+
+--
+-- TOC entry 3806 (class 2620 OID 16886)
+-- Name: sessions trg_sessions_updated; Type: TRIGGER; Schema: public; Owner: lab1
+--
+
+CREATE TRIGGER trg_sessions_updated BEFORE UPDATE ON public.sessions FOR EACH ROW EXECUTE FUNCTION public.set_updated_at();
+
+
+--
+-- TOC entry 3808 (class 2620 OID 16989)
+-- Name: user_achievements trg_user_achievements_updated; Type: TRIGGER; Schema: public; Owner: lab1
+--
+
+CREATE TRIGGER trg_user_achievements_updated BEFORE UPDATE ON public.user_achievements FOR EACH ROW EXECUTE FUNCTION public.set_updated_at();
+
+
+--
+-- TOC entry 3805 (class 2620 OID 17092)
+-- Name: user_progress trg_user_progress_before_update; Type: TRIGGER; Schema: public; Owner: lab1
+--
+
+CREATE TRIGGER trg_user_progress_before_update BEFORE UPDATE ON public.user_progress FOR EACH ROW EXECUTE FUNCTION public.fn_user_progress_before_update();
+
+
+--
+-- TOC entry 3804 (class 2620 OID 16770)
+-- Name: user_settings trg_user_settings_updated; Type: TRIGGER; Schema: public; Owner: lab1
+--
+
+CREATE TRIGGER trg_user_settings_updated BEFORE UPDATE ON public.user_settings FOR EACH ROW EXECUTE FUNCTION public.set_updated_at();
+
+
+--
+-- TOC entry 3802 (class 2620 OID 17090)
+-- Name: users trg_users_after_insert; Type: TRIGGER; Schema: public; Owner: lab1
+--
+
+CREATE TRIGGER trg_users_after_insert AFTER INSERT ON public.users FOR EACH ROW EXECUTE FUNCTION public.fn_user_after_insert();
+
+
+--
+-- TOC entry 3803 (class 2620 OID 16706)
+-- Name: users trg_users_updated; Type: TRIGGER; Schema: public; Owner: lab1
+--
+
+CREATE TRIGGER trg_users_updated BEFORE UPDATE ON public.users FOR EACH ROW EXECUTE FUNCTION public.set_updated_at();
+
+
+--
+-- TOC entry 3793 (class 2606 OID 16959)
+-- Name: achievements achievements_unlock_level_fkey; Type: FK CONSTRAINT; Schema: public; Owner: lab1
+--
+
+ALTER TABLE ONLY public.achievements
+    ADD CONSTRAINT achievements_unlock_level_fkey FOREIGN KEY (unlock_level) REFERENCES public.levels(level) ON DELETE SET NULL;
+
+
+--
+-- TOC entry 3796 (class 2606 OID 17010)
+-- Name: bonus_definitions bonus_definitions_min_level_fkey; Type: FK CONSTRAINT; Schema: public; Owner: lab1
+--
+
+ALTER TABLE ONLY public.bonus_definitions
+    ADD CONSTRAINT bonus_definitions_min_level_fkey FOREIGN KEY (min_level) REFERENCES public.levels(level) ON DELETE RESTRICT;
+
+
+--
+-- TOC entry 3792 (class 2606 OID 16936)
+-- Name: character_stats character_stats_user_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: lab1
+--
+
+ALTER TABLE ONLY public.character_stats
+    ADD CONSTRAINT character_stats_user_id_fkey FOREIGN KEY (user_id) REFERENCES public.users(id) ON DELETE CASCADE;
+
+
+--
+-- TOC entry 3776 (class 2606 OID 16603)
+-- Name: exercise_modes exercise_modes_default_language_code_fkey; Type: FK CONSTRAINT; Schema: public; Owner: lab1
+--
+
+ALTER TABLE ONLY public.exercise_modes
+    ADD CONSTRAINT exercise_modes_default_language_code_fkey FOREIGN KEY (default_language_code) REFERENCES public.languages(code) ON DELETE SET NULL;
+
+
+--
+-- TOC entry 3774 (class 2606 OID 16585)
+-- Name: key_variants key_variants_key_code_fkey; Type: FK CONSTRAINT; Schema: public; Owner: lab1
+--
+
+ALTER TABLE ONLY public.key_variants
+    ADD CONSTRAINT key_variants_key_code_fkey FOREIGN KEY (key_code) REFERENCES public.keys(key_code) ON DELETE CASCADE;
+
+
+--
+-- TOC entry 3775 (class 2606 OID 16580)
+-- Name: key_variants key_variants_layout_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: lab1
+--
+
+ALTER TABLE ONLY public.key_variants
+    ADD CONSTRAINT key_variants_layout_id_fkey FOREIGN KEY (layout_id) REFERENCES public.keyboard_layouts(id) ON DELETE CASCADE;
+
+
+--
+-- TOC entry 3773 (class 2606 OID 16552)
+-- Name: keyboard_layouts keyboard_layouts_language_code_fkey; Type: FK CONSTRAINT; Schema: public; Owner: lab1
+--
+
+ALTER TABLE ONLY public.keyboard_layouts
+    ADD CONSTRAINT keyboard_layouts_language_code_fkey FOREIGN KEY (language_code) REFERENCES public.languages(code) ON DELETE RESTRICT;
+
+
+--
+-- TOC entry 3780 (class 2606 OID 16719)
+-- Name: oauth_accounts oauth_accounts_user_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: lab1
+--
+
+ALTER TABLE ONLY public.oauth_accounts
+    ADD CONSTRAINT oauth_accounts_user_id_fkey FOREIGN KEY (user_id) REFERENCES public.users(id) ON DELETE CASCADE;
+
+
+--
+-- TOC entry 3781 (class 2606 OID 16736)
+-- Name: refresh_tokens refresh_tokens_user_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: lab1
+--
+
+ALTER TABLE ONLY public.refresh_tokens
+    ADD CONSTRAINT refresh_tokens_user_id_fkey FOREIGN KEY (user_id) REFERENCES public.users(id) ON DELETE CASCADE;
+
+
+--
+-- TOC entry 3778 (class 2606 OID 16645)
+-- Name: sentences sentences_language_code_fkey; Type: FK CONSTRAINT; Schema: public; Owner: lab1
+--
+
+ALTER TABLE ONLY public.sentences
+    ADD CONSTRAINT sentences_language_code_fkey FOREIGN KEY (language_code) REFERENCES public.languages(code) ON DELETE CASCADE;
+
+
+--
+-- TOC entry 3800 (class 2606 OID 17063)
+-- Name: session_bonus_activations session_bonus_activations_bonus_code_fkey; Type: FK CONSTRAINT; Schema: public; Owner: lab1
+--
+
+ALTER TABLE ONLY public.session_bonus_activations
+    ADD CONSTRAINT session_bonus_activations_bonus_code_fkey FOREIGN KEY (bonus_code) REFERENCES public.bonus_definitions(code) ON DELETE CASCADE;
+
+
+--
+-- TOC entry 3801 (class 2606 OID 17058)
+-- Name: session_bonus_activations session_bonus_activations_session_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: lab1
+--
+
+ALTER TABLE ONLY public.session_bonus_activations
+    ADD CONSTRAINT session_bonus_activations_session_id_fkey FOREIGN KEY (session_id) REFERENCES public.sessions(id) ON DELETE CASCADE;
+
+
+--
+-- TOC entry 3790 (class 2606 OID 16909)
+-- Name: session_events session_events_key_code_fkey; Type: FK CONSTRAINT; Schema: public; Owner: lab1
+--
+
+ALTER TABLE ONLY public.session_events
+    ADD CONSTRAINT session_events_key_code_fkey FOREIGN KEY (key_code) REFERENCES public.keys(key_code) ON DELETE SET NULL;
+
+
+--
+-- TOC entry 3791 (class 2606 OID 16904)
+-- Name: session_events session_events_session_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: lab1
+--
+
+ALTER TABLE ONLY public.session_events
+    ADD CONSTRAINT session_events_session_id_fkey FOREIGN KEY (session_id) REFERENCES public.sessions(id) ON DELETE CASCADE;
+
+
+--
+-- TOC entry 3786 (class 2606 OID 16878)
+-- Name: sessions sessions_keyboard_layout_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: lab1
+--
+
+ALTER TABLE ONLY public.sessions
+    ADD CONSTRAINT sessions_keyboard_layout_id_fkey FOREIGN KEY (keyboard_layout_id) REFERENCES public.keyboard_layouts(id) ON DELETE SET NULL;
+
+
+--
+-- TOC entry 3787 (class 2606 OID 16873)
+-- Name: sessions sessions_language_code_fkey; Type: FK CONSTRAINT; Schema: public; Owner: lab1
+--
+
+ALTER TABLE ONLY public.sessions
+    ADD CONSTRAINT sessions_language_code_fkey FOREIGN KEY (language_code) REFERENCES public.languages(code) ON DELETE RESTRICT;
+
+
+--
+-- TOC entry 3788 (class 2606 OID 16868)
+-- Name: sessions sessions_mode_code_fkey; Type: FK CONSTRAINT; Schema: public; Owner: lab1
+--
+
+ALTER TABLE ONLY public.sessions
+    ADD CONSTRAINT sessions_mode_code_fkey FOREIGN KEY (mode_code) REFERENCES public.exercise_modes(code) ON DELETE RESTRICT;
+
+
+--
+-- TOC entry 3789 (class 2606 OID 16863)
+-- Name: sessions sessions_user_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: lab1
+--
+
+ALTER TABLE ONLY public.sessions
+    ADD CONSTRAINT sessions_user_id_fkey FOREIGN KEY (user_id) REFERENCES public.users(id) ON DELETE SET NULL;
+
+
+--
+-- TOC entry 3779 (class 2606 OID 16681)
+-- Name: symbol_sets symbol_sets_language_code_fkey; Type: FK CONSTRAINT; Schema: public; Owner: lab1
+--
+
+ALTER TABLE ONLY public.symbol_sets
+    ADD CONSTRAINT symbol_sets_language_code_fkey FOREIGN KEY (language_code) REFERENCES public.languages(code) ON DELETE SET NULL;
+
+
+--
+-- TOC entry 3794 (class 2606 OID 16983)
+-- Name: user_achievements user_achievements_achievement_code_fkey; Type: FK CONSTRAINT; Schema: public; Owner: lab1
+--
+
+ALTER TABLE ONLY public.user_achievements
+    ADD CONSTRAINT user_achievements_achievement_code_fkey FOREIGN KEY (achievement_code) REFERENCES public.achievements(code) ON DELETE CASCADE;
+
+
+--
+-- TOC entry 3795 (class 2606 OID 16978)
+-- Name: user_achievements user_achievements_user_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: lab1
+--
+
+ALTER TABLE ONLY public.user_achievements
+    ADD CONSTRAINT user_achievements_user_id_fkey FOREIGN KEY (user_id) REFERENCES public.users(id) ON DELETE CASCADE;
+
+
+--
+-- TOC entry 3797 (class 2606 OID 17033)
+-- Name: user_active_bonuses user_active_bonuses_bonus_code_fkey; Type: FK CONSTRAINT; Schema: public; Owner: lab1
+--
+
+ALTER TABLE ONLY public.user_active_bonuses
+    ADD CONSTRAINT user_active_bonuses_bonus_code_fkey FOREIGN KEY (bonus_code) REFERENCES public.bonus_definitions(code) ON DELETE CASCADE;
+
+
+--
+-- TOC entry 3798 (class 2606 OID 17038)
+-- Name: user_active_bonuses user_active_bonuses_session_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: lab1
+--
+
+ALTER TABLE ONLY public.user_active_bonuses
+    ADD CONSTRAINT user_active_bonuses_session_id_fkey FOREIGN KEY (session_id) REFERENCES public.sessions(id) ON DELETE CASCADE;
+
+
+--
+-- TOC entry 3799 (class 2606 OID 17028)
+-- Name: user_active_bonuses user_active_bonuses_user_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: lab1
+--
+
+ALTER TABLE ONLY public.user_active_bonuses
+    ADD CONSTRAINT user_active_bonuses_user_id_fkey FOREIGN KEY (user_id) REFERENCES public.users(id) ON DELETE CASCADE;
+
+
+--
+-- TOC entry 3784 (class 2606 OID 16815)
+-- Name: user_progress user_progress_level_fkey; Type: FK CONSTRAINT; Schema: public; Owner: lab1
+--
+
+ALTER TABLE ONLY public.user_progress
+    ADD CONSTRAINT user_progress_level_fkey FOREIGN KEY (level) REFERENCES public.levels(level) ON DELETE RESTRICT;
+
+
+--
+-- TOC entry 3785 (class 2606 OID 16810)
+-- Name: user_progress user_progress_user_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: lab1
+--
+
+ALTER TABLE ONLY public.user_progress
+    ADD CONSTRAINT user_progress_user_id_fkey FOREIGN KEY (user_id) REFERENCES public.users(id) ON DELETE CASCADE;
+
+
+--
+-- TOC entry 3782 (class 2606 OID 16765)
+-- Name: user_settings user_settings_keyboard_layout_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: lab1
+--
+
+ALTER TABLE ONLY public.user_settings
+    ADD CONSTRAINT user_settings_keyboard_layout_id_fkey FOREIGN KEY (keyboard_layout_id) REFERENCES public.keyboard_layouts(id) ON DELETE SET NULL;
+
+
+--
+-- TOC entry 3783 (class 2606 OID 16760)
+-- Name: user_settings user_settings_user_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: lab1
+--
+
+ALTER TABLE ONLY public.user_settings
+    ADD CONSTRAINT user_settings_user_id_fkey FOREIGN KEY (user_id) REFERENCES public.users(id) ON DELETE CASCADE;
+
+
+--
+-- TOC entry 3777 (class 2606 OID 16624)
+-- Name: words words_language_code_fkey; Type: FK CONSTRAINT; Schema: public; Owner: lab1
+--
+
+ALTER TABLE ONLY public.words
+    ADD CONSTRAINT words_language_code_fkey FOREIGN KEY (language_code) REFERENCES public.languages(code) ON DELETE CASCADE;
+
+
+-- Completed on 2026-10-19 23:52:29
+
+--
+-- PostgreSQL database dump complete
+--
+
+\unrestrict kLXheb6Ac5pb9Ozp0mpU08aE6WzXJiYv33fx0FpK1m7Ms0vb5uQEku8THo1xqJn
+
